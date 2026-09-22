@@ -29,8 +29,8 @@ python dashboard/dashboard.py
 
 引擎每 5 秒把当前挂单/持仓写入 `status.json`。页面只在首次打开时渲染骨架，之后用 `/api/view` 原地改数字和表格。
 
-- `hummingbot/data/bot/status.json` — 策略实时状态（由引擎定时写入）
-- `hummingbot/logs/logs_conf_okx_multi.log` — 运行日志
+- `data/bot/status.json` — 策略实时状态（由引擎定时写入）
+- `logs/logs_conf_okx_multi.log` — 运行日志
 
 快照超过 20 秒未更新时，顶部会标 `STALE`。
 

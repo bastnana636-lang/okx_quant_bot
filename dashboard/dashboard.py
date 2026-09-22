@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ─── 路径配置 ────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent.parent / "hummingbot"
+BASE_DIR = Path(__file__).parent.parent
 STATUS_FILE = BASE_DIR / "data" / "bot" / "status.json"
 LOG_FILE    = BASE_DIR / "logs" / "logs_conf_okx_multi.log"
 PORT        = 8888
