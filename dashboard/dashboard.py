@@ -2,19 +2,29 @@
 """
 OKX Quant Trader — Real-time Dashboard
 =======================================
-读取 ../hummingbot/data/bot/status.json，以 HTTP 服务方式暴露实时面板。
-完全独立，不修改任何现有文件，不需要额外安装任何依赖。
+读取 data/bot/status.json，以 HTTP 服务方式暴露实时面板和策略配置页。
+配置页把杠杆、开单金额和策略参数写回 conf/controllers。
+不需要额外安装任何依赖。
 
 用法:
     python dashboard/dashboard.py
     # 然后在浏览器打开 http://localhost:8888
 """
 
+import html
 import json
+import os
 import re
+import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+try:
+    from strategy_config import SHARED_FIELDS, ConfigError, apply_config, load_config
+except ImportError:  # imported as dashboard.dashboard
+    from dashboard.strategy_config import SHARED_FIELDS, ConfigError, apply_config, load_config
 
 # ─── 路径配置 ────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent.parent
@@ -22,6 +32,10 @@ STATUS_FILE = BASE_DIR / "data" / "bot" / "status.json"
 LOG_FILE    = BASE_DIR / "logs" / "logs_conf_okx_multi.log"
 PORT        = 8888
 STALE_AFTER_S = 20  # 引擎每 5 秒写一次快照；超过该秒数视为过期
+OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
+TICKER_TTL_S = 5
+_ticker_lock = threading.Lock()
+_ticker_cache: dict = {"fetched_at": 0.0, "by_inst": {}, "error": None}
 
 
 def _log(msg: str) -> None:
@@ -92,6 +106,175 @@ def coin_label(controller: str) -> str:
     # 提取末尾的币种名，如 okx_pmm_btc → btc → BTC
     symbol = controller.split("_")[-1].upper()
     return COIN_ICONS.get(symbol, f"◆  {symbol}")
+
+
+def pair_label(pair: str) -> str:
+    symbol = pair.split("-")[0].upper()
+    return COIN_ICONS.get(symbol, f"◆  {symbol}")
+
+
+def strategy_pairs(status: dict, perf_rows: list[dict]) -> list[str]:
+    """面板上的币种跟随当前策略，不扫全市场。"""
+    pairs: list[str] = []
+    for row in perf_rows:
+        ctrl = row["controller"]
+        if ctrl == "GLOBAL TOTAL":
+            continue
+        pair = f"{ctrl.split('_')[-1].upper()}-USDT"
+        if pair not in pairs:
+            pairs.append(pair)
+    if pairs:
+        return pairs
+    connectors = ((status.get("engine") or {}).get("connectors") or {})
+    for conn in connectors.values():
+        for pair in conn.get("trading_pairs") or []:
+            if pair not in pairs:
+                pairs.append(pair)
+    return pairs
+
+
+def _num(row: dict, key: str) -> float | None:
+    try:
+        value = float(row[key])
+    except (TypeError, ValueError, KeyError):
+        return None
+    if value != value:  # NaN
+        return None
+    return value
+
+
+def _okx_openers():
+    """本机访问 OKX 走本地代理；代理不可用时再直连。"""
+    seen = set()
+    candidates = ["http://127.0.0.1:7897"]
+    for key in ("https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+        value = os.environ.get(key)
+        if value:
+            candidates.append(value)
+    openers = []
+    for proxy in candidates:
+        if proxy in seen:
+            continue
+        seen.add(proxy)
+        openers.append(urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        ))
+    openers.append(urllib.request.build_opener(urllib.request.ProxyHandler({})))
+    return openers
+
+
+def fetch_swap_tickers() -> tuple[dict[str, dict], str | None]:
+    """拉 OKX USDT 永续公开行情，短缓存，失败时沿用上一份。"""
+    now = time.time()
+    with _ticker_lock:
+        cached = _ticker_cache["by_inst"]
+        age = now - float(_ticker_cache["fetched_at"] or 0)
+        if cached and age < TICKER_TTL_S:
+            return cached, _ticker_cache["error"]
+        req = urllib.request.Request(
+            OKX_TICKERS_URL,
+            headers={"User-Agent": "okx-quant-dashboard", "Accept": "application/json"},
+        )
+        last_error = "quotes unavailable"
+        payload = None
+        for opener in _okx_openers():
+            try:
+                with opener.open(req, timeout=8) as resp:
+                    payload = json.load(resp)
+                break
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+        if not payload or str(payload.get("code")) != "0":
+            if payload and payload.get("msg"):
+                last_error = str(payload.get("msg"))
+            _ticker_cache["error"] = last_error
+            if cached:
+                return cached, last_error
+            return {}, last_error
+        by_inst = {}
+        for row in payload.get("data") or []:
+            inst = row.get("instId") or ""
+            if inst.endswith("-USDT-SWAP"):
+                by_inst[inst] = row
+        _ticker_cache["by_inst"] = by_inst
+        _ticker_cache["fetched_at"] = time.time()
+        _ticker_cache["error"] = None
+        return by_inst, None
+
+
+def fmt_px(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if value >= 100:
+        return f"{value:,.2f}"
+    if value >= 1:
+        return f"{value:,.4f}"
+    return f"{value:.6f}"
+
+
+def fmt_quote_vol(base_vol: float | None, last: float | None) -> str:
+    if base_vol is None or last is None:
+        return "-"
+    quote = base_vol * last
+    if quote >= 1e9:
+        return f"{quote / 1e9:.2f}B"
+    if quote >= 1e6:
+        return f"{quote / 1e6:.2f}M"
+    if quote >= 1e3:
+        return f"{quote / 1e3:.1f}K"
+    return f"{quote:,.0f}"
+
+
+def build_markets(pairs: list[str]) -> tuple[str, str]:
+    tickers, error = fetch_swap_tickers()
+    age = time.time() - float(_ticker_cache["fetched_at"] or 0)
+    if _ticker_cache["by_inst"]:
+        meta = f"OKX SWAP · {age:.0f}s"
+        if error:
+            meta += " · STALE"
+    else:
+        meta = error or "no quotes"
+    rows = []
+    for pair in pairs:
+        row = tickers.get(f"{pair}-SWAP") or {}
+        last = _num(row, "last")
+        bid = _num(row, "bidPx")
+        ask = _num(row, "askPx")
+        open24 = _num(row, "open24h")
+        high = _num(row, "high24h")
+        low = _num(row, "low24h")
+        vol = _num(row, "volCcy24h")
+        if last is None:
+            rows.append(
+                f"<tr><td>{pair_label(pair)}</td>"
+                + '<td colspan="8" class="empty">-- NO QUOTE --</td></tr>'
+            )
+            continue
+        chg = ((last - open24) / open24) if open24 else None
+        chg_html = "-" if chg is None else f'<span class="{color_val(chg)}">{chg * 100:+.2f}%</span>'
+        if bid and ask and ask >= bid:
+            mid = (bid + ask) / 2
+            spread = (ask - bid) / mid if mid else 0
+            spread_cls = "neg" if spread > 0.002 else ""
+            spread_html = f'<span class="{spread_cls}">{spread * 100:.3f}%</span>'
+        else:
+            spread_html = "-"
+        rows.append(
+            "<tr>"
+            f"<td>{pair_label(pair)}</td>"
+            f"<td>{fmt_px(last)}</td>"
+            f"<td>{chg_html}</td>"
+            f"<td>{fmt_px(bid)}</td>"
+            f"<td>{fmt_px(ask)}</td>"
+            f"<td>{spread_html}</td>"
+            f"<td>{fmt_px(high)}</td>"
+            f"<td>{fmt_px(low)}</td>"
+            f"<td>{fmt_quote_vol(vol, last)}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append('<tr><td colspan="9" class="empty">-- NO MARKETS --</td></tr>')
+    return "".join(rows), meta
 
 
 def parse_controller_signals(status: dict) -> dict[str, dict]:
@@ -432,10 +615,176 @@ def build_view(status: dict) -> dict:
     }
 
 
-def render_html(status: dict) -> str:
-    view = build_view(status)
-    if view.get("error"):
+_config_lock = threading.Lock()
+
+
+def config_view() -> dict:
+    return load_config()
+
+
+def save_config(payload: dict) -> dict:
+    with _config_lock:
+        return apply_config(payload)
+
+
+def _field_control(key: str, label: str, kind: str, bounds, value: str, shared: bool) -> str:
+    attr = f'data-shared="{html.escape(key)}"' if shared else f'data-k="{html.escape(key)}"'
+    if kind == "choice":
+        options = "".join(
+            f'<option value="{html.escape(item)}"{" selected" if item == value else ""}>{html.escape(item)}</option>'
+            for item in bounds
+        )
+        control = f"<select {attr}>{options}</select>"
+    elif kind == "bool":
+        current = value.lower()
+        options = "".join(
+            f'<option value="{item}"{" selected" if item == current else ""}>{item}</option>'
+            for item in ("false", "true")
+        )
+        control = f"<select {attr}>{options}</select>"
+    else:
+        control = f'<input {attr} value="{html.escape(value)}" inputmode="decimal" autocomplete="off">'
+    return (
+        f'<label class="field"><span>{html.escape(label)}</span>{control}</label>'
+    )
+
+
+def render_config_body() -> str:
+    try:
+        view = load_config()
+    except ConfigError as exc:
+        return f'<div class="card error">⚠️ {html.escape(str(exc))}</div>'
+
+    rows = []
+    for pair in view["pairs"]:
+        rows.append(
+            "<tr class=\"pair-row\" data-file=\"{file}\">"
+            "<td>{pair}</td>"
+            "<td><input data-k=\"leverage\" value=\"{leverage}\" inputmode=\"numeric\" autocomplete=\"off\"></td>"
+            "<td><input data-k=\"total_amount_quote\" value=\"{amount}\" inputmode=\"decimal\" autocomplete=\"off\"></td>"
+            "<td><input data-k=\"take_profit_quote\" value=\"{tp}\" inputmode=\"decimal\" autocomplete=\"off\"></td>"
+            "</tr>".format(
+                file=html.escape(pair["file"]),
+                pair=html.escape(pair_label(pair["trading_pair"]) + "  " + pair["trading_pair"]),
+                leverage=html.escape(pair["leverage"]),
+                amount=html.escape(pair["total_amount_quote"]),
+                tp=html.escape(pair["take_profit_quote"]),
+            )
+        )
+    shared_controls = "".join(
+        _field_control(key, label, kind, bounds, view["shared"][key], shared=True)
+        for key, label, kind, bounds in SHARED_FIELDS
+    )
+    mixed = [label for key, label, _, _ in SHARED_FIELDS if view["shared_mixed"].get(key)]
+    mixed_html = ""
+    if mixed:
+        mixed_html = (
+            '<p class="hint warn">这些参数在各币种间不一致，保存后会写成同一个值：'
+            + html.escape("、".join(mixed)) + "</p>"
+        )
+    return f"""
+        <form id="config-form">
+          <div class="card">
+            <h2>// LEVERAGE</h2>
+            <p class="hint">杠杆默认 3，允许 1 到 5。填好后点「应用到全部币种」，或在下表逐个修改。</p>
+            <div class="inline-form">
+              <label class="field"><span>统一杠杆</span>
+                <input id="apply-leverage" value="3" inputmode="numeric" autocomplete="off">
+              </label>
+              <button type="button" id="apply-leverage-btn">应用到全部币种</button>
+            </div>
+          </div>
+          <div class="card">
+            <h2>// ORDER SIZE</h2>
+            <p class="hint">开单金额是单笔最大名义本金（USDT），不是保证金。止盈是单笔锁定的现金利润。</p>
+            <table>
+              <thead><tr>
+                <th>PAIR</th><th>LEVERAGE</th><th>NOTIONAL USDT</th><th>CASH TP</th>
+              </tr></thead>
+              <tbody>{''.join(rows)}</tbody>
+            </table>
+          </div>
+          <div class="card">
+            <h2>// STRATEGY PARAMS</h2>
+            <p class="hint">下面的参数对当前启用的全部币种生效。保存写入 conf/controllers，重启策略后才会用于实盘。</p>
+            {mixed_html}
+            <div class="field-grid">{shared_controls}</div>
+          </div>
+          <div class="save-bar">
+            <button type="submit" class="save">保存配置</button>
+            <span id="config-msg" class="hint"></span>
+          </div>
+        </form>
+        <script>
+          (function() {{
+            var form = document.getElementById('config-form');
+            var msg = document.getElementById('config-msg');
+            document.getElementById('apply-leverage-btn').onclick = function() {{
+              var value = document.getElementById('apply-leverage').value || '3';
+              document.querySelectorAll('[data-k="leverage"]').forEach(function(el) {{ el.value = value; }});
+            }};
+            form.onsubmit = function(event) {{
+              event.preventDefault();
+              var pairs = [].map.call(document.querySelectorAll('.pair-row'), function(row) {{
+                var item = {{ file: row.getAttribute('data-file') }};
+                row.querySelectorAll('[data-k]').forEach(function(el) {{ item[el.getAttribute('data-k')] = el.value; }});
+                return item;
+              }});
+              var shared = {{}};
+              document.querySelectorAll('[data-shared]').forEach(function(el) {{
+                shared[el.getAttribute('data-shared')] = el.value;
+              }});
+              msg.className = 'hint';
+              msg.textContent = '保存中...';
+              fetch('/api/config', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ pairs: pairs, shared: shared }})
+              }}).then(function(response) {{
+                return response.json().then(function(data) {{ return {{ ok: response.ok, data: data }}; }});
+              }}).then(function(result) {{
+                msg.className = result.ok && result.data.ok ? 'hint ok' : 'hint warn';
+                msg.textContent = (result.data && result.data.message) || '保存失败';
+              }}).catch(function() {{
+                msg.className = 'hint warn';
+                msg.textContent = '保存失败';
+              }});
+            }};
+          }})();
+        </script>"""
+
+
+def markets_view(status: dict) -> dict:
+    """行情页单独拉 OKX 公开报价，主面板轮询不带这份数据。"""
+    err = status.get("error")
+    if err:
+        return {"error": str(err), "markets_html": "", "markets_meta": ""}
+    html, meta = build_markets(strategy_pairs(status, parse_performance_table(status)))
+    return {"error": None, "markets_html": html, "markets_meta": meta}
+
+
+def render_html(status: dict, page: str = "dashboard") -> str:
+    if page == "config":
+        view = {}
+        body = render_config_body()
+    else:
+        view = markets_view(status) if page == "markets" else build_view(status)
+    if page != "config" and view.get("error"):
         body = f'<div class="card error">⚠️ 无法读取状态文件: {view["error"]}</div>'
+    elif page == "config":
+        pass
+    elif page == "markets":
+        body = f"""
+        <div class="card">
+          <h2>// MARKETS <span class="section-meta" id="markets-meta">{view["markets_meta"]}</span></h2>
+          <table>
+            <thead><tr>
+              <th>PAIR</th><th>LAST</th><th>24H</th><th>BID</th><th>ASK</th>
+              <th>SPREAD</th><th>HIGH 24H</th><th>LOW 24H</th><th>VOL 24H</th>
+            </tr></thead>
+            <tbody id="markets-body">{view["markets_html"]}</tbody>
+          </table>
+        </div>"""
     else:
         age_label = fmt_snapshot_age(
             (time.time() - view["updated_at"]) if view["updated_at"] else None
@@ -521,12 +870,31 @@ def render_html(status: dict) -> str:
         </div>"""
 
     now_str = time.strftime("%H:%M:%S")
+    titles = {
+        "markets": ("OKX QUANT // MARKETS", "MARKETS"),
+        "config": ("OKX QUANT // CONFIG", "CONFIG"),
+    }
+    page_title, heading = titles.get(page, ("OKX QUANT // DASHBOARD", "LIVE DASHBOARD"))
+    nav_links = []
+    for key, href, label in (
+        ("dashboard", "/", "DASHBOARD"),
+        ("markets", "/markets", "MARKETS"),
+        ("config", "/config", "CONFIG"),
+    ):
+        active = "active" if page == key else ""
+        nav_links.append(f'<a href="{href}" class="{active}">{label}</a>')
+    nav_html = "\n      ".join(nav_links)
+    footer = (
+        "[ LOCAL CONFIG // RESTART STRATEGY TO APPLY ]"
+        if page == "config"
+        else "[ READ-ONLY MONITOR // NO TRADE SIDE EFFECTS ]"
+    )
     return f"""<!DOCTYPE html>
 <html lang="zh">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OKX QUANT // DASHBOARD</title>
+  <title>{page_title}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=VT323&display=swap" rel="stylesheet">
   <style>
@@ -573,6 +941,38 @@ def render_html(status: dict) -> str:
       text-shadow: 0 0 10px var(--accent), 0 0 2px #fff;
       letter-spacing: 0.08em;
     }}
+    header h1 a {{ color: inherit; text-decoration: none; }}
+    .nav {{ display: flex; gap: 8px; align-items: center; }}
+    .nav a {{
+      color: var(--muted); text-decoration: none;
+      border: 1px solid var(--border); padding: 2px 12px;
+      letter-spacing: 0.08em;
+    }}
+    .nav a:hover, .nav a.active {{ color: var(--accent); border-color: var(--accent); }}
+    .hint {{ color: var(--muted); font-size: 15px; margin: 0 0 10px; }}
+    .hint.ok {{ color: var(--pos); }}
+    .hint.warn {{ color: var(--warn); }}
+    .field-grid {{
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px;
+    }}
+    .field span {{
+      display: block; color: var(--muted); font-size: 13px;
+      letter-spacing: 0.08em; text-transform: uppercase;
+    }}
+    .field input, .field select, td input {{
+      width: 100%; background: #000; color: var(--text);
+      border: 1px solid var(--border); font-family: inherit; font-size: 18px;
+      padding: 4px 8px;
+    }}
+    td input {{ width: 8rem; }}
+    .inline-form {{ display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }}
+    .inline-form .field {{ width: 8rem; }}
+    button, .save {{
+      background: #000; color: var(--accent); border: 1px solid var(--accent);
+      font-family: inherit; font-size: 18px; padding: 6px 14px; cursor: pointer;
+    }}
+    button:hover, .save:hover {{ background: #041418; }}
+    .save-bar {{ display: flex; gap: 14px; align-items: center; margin: 4px 0 12px; }}
     .refresh-info {{ color: var(--muted); font-size: 15px; letter-spacing: 0.06em; }}
     /* ── layout ── */
     .container {{ max-width: 1600px; margin: 0 auto; padding: 14px 18px; }}
@@ -603,6 +1003,10 @@ def render_html(status: dict) -> str:
       padding-bottom: 5px;
       border-bottom: 1px solid var(--border);
       text-transform: uppercase; letter-spacing: 0.1em;
+    }}
+    .section-meta {{
+      color: var(--muted); font-size: 14px; letter-spacing: 0.06em;
+      text-transform: none; margin-left: 8px;
     }}
     /* ── tables ── */
     table {{ width: 100%; border-collapse: collapse; }}
@@ -657,6 +1061,7 @@ def render_html(status: dict) -> str:
   <script>
     (function() {{
       var POLL_MS = 3000;
+      var PAGE = "{page}";
       var last = {{}};
       var meta = {{ updatedAt: 0, uptimeS: 0, fetchedAt: Date.now() }};
 
@@ -707,6 +1112,13 @@ def render_html(status: dict) -> str:
           last = {{}};
           return;
         }}
+        if (PAGE === 'config') return;
+        if (PAGE === 'markets') {{
+          setText('markets-meta', data.markets_meta || '');
+          setHtml('markets-body', data.markets_html);
+          tickClock();
+          return;
+        }}
         meta.updatedAt = data.updated_at || 0;
         meta.uptimeS = data.uptime_s || 0;
         meta.fetchedAt = Date.now();
@@ -735,13 +1147,15 @@ def render_html(status: dict) -> str:
         tickClock();
       }}
       function poll() {{
-        fetch('/api/view', {{ cache: 'no-store' }})
+        if (PAGE === 'config') return;
+        var url = PAGE === 'markets' ? '/api/markets' : '/api/view';
+        fetch(url, {{ cache: 'no-store' }})
           .then(function(r) {{ return r.json(); }})
           .then(apply)
           .catch(function() {{}});
       }}
       window.addEventListener('load', function() {{
-        ['status-badge', 'snapshot-badge', 'stale-banner', 'perf-body',
+        ['status-badge', 'snapshot-badge', 'stale-banner', 'markets-body', 'perf-body',
          'pos-body', 'ord-body', 'exec-body', 'logbox'].forEach(function(id) {{
           var el = $(id);
           if (el) last[id] = el.innerHTML;
@@ -757,13 +1171,16 @@ def render_html(status: dict) -> str:
 </head>
 <body>
   <header>
-    <h1>&gt; OKX_QUANT // LIVE DASHBOARD<span class="cursor">_</span></h1>
+    <h1><a href="/">&gt; OKX_QUANT // {heading}<span class="cursor">_</span></a></h1>
+    <nav class="nav">
+      {nav_html}
+    </nav>
     <div class="refresh-info">LIVE PATCH &nbsp;|&nbsp; <span id="clock">{now_str}</span></div>
   </header>
   <div class="container" id="app">
     {body}
   </div>
-  <footer>[ READ-ONLY MONITOR // NO TRADE SIDE EFFECTS ]</footer>
+  <footer>{footer}</footer>
 </body>
 </html>"""
 
@@ -773,25 +1190,42 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # 静默日志
 
+    def _send(self, status: int, body: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json(self, status: int, data: dict) -> None:
+        self._send(status, json.dumps(data, ensure_ascii=False).encode("utf-8"),
+                   "application/json; charset=utf-8")
+
     def do_GET(self):
         try:
-            if self.path in ("/api/status", "/api/view"):
-                data = read_status() if self.path == "/api/status" else build_view(read_status())
-                body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            elif self.path in ("/", "/index.html"):
-                status = read_status()
-                html   = render_html(status).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(html)))
-                self.end_headers()
-                self.wfile.write(html)
+            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if path in ("/api/status", "/api/view", "/api/markets", "/api/config"):
+                if path == "/api/config":
+                    try:
+                        data = config_view()
+                    except ConfigError as exc:
+                        self._send_json(400, {"ok": False, "message": str(exc)})
+                        return
+                else:
+                    status = read_status()
+                    if path == "/api/status":
+                        data = status
+                    elif path == "/api/markets":
+                        data = markets_view(status)
+                    else:
+                        data = build_view(status)
+                self._send_json(200, data)
+            elif path in ("/", "/index.html", "/markets", "/config"):
+                status = {} if path == "/config" else read_status()
+                page = {"/markets": "markets", "/config": "config"}.get(path, "dashboard")
+                page_html = render_html(status, page).encode("utf-8")
+                self._send(200, page_html, "text/html; charset=utf-8")
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -802,6 +1236,40 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self.send_response(500)
                 self.end_headers()
+            except Exception:
+                pass
+
+    def do_POST(self):
+        try:
+            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if path != "/api/config":
+                self.send_response(404)
+                self.end_headers()
+                return
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            if length < 0 or length > 256_000:
+                self._send_json(413, {"ok": False, "message": "请求过大"})
+                return
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                written = save_config(payload)
+            except ConfigError as exc:
+                self._send_json(400, {"ok": False, "message": str(exc)})
+                return
+            except json.JSONDecodeError:
+                self._send_json(400, {"ok": False, "message": "请求不是 JSON"})
+                return
+            self._send_json(200, {
+                "ok": True,
+                "files": written["files"],
+                "message": "已写入 conf/controllers。请执行 make stop && make start 后生效。",
+            })
+        except BrokenPipeError:
+            return
+        except Exception as exc:
+            _log(f"request {self.path} failed: {type(exc).__name__}: {exc}")
+            try:
+                self._send_json(500, {"ok": False, "message": "保存失败"})
             except Exception:
                 pass
 

@@ -104,8 +104,12 @@ CONFIG ?= conf_okx_multi.yml
 READY_TIMEOUT ?= 120
 
 start:
-	@set -eu; set -a; if [ -f ./.compose.env ]; then . ./.compose.env; fi; set +a; \
-	docker compose up -d hummingbot; \
+	@set -eu; \
+	if [ "$${SKIP_SETUP:-}" != 1 ]; then \
+		python3 scripts/ensure_setup.py; \
+		eval "$$(python3 scripts/ensure_setup.py --shell-exports)"; \
+	fi; \
+	docker compose --env-file .compose.env up -d hummingbot; \
 	docker exec hummingbot python -m scripts.validate_mean_reversion --config "$(CONFIG)"; \
 	docker exec -e HBOT_PASSWORD="$$HBOT_PASSWORD" hummingbot hbot start "$(CONFIG)" --v2-script --replace; \
 	$(MAKE) wait-ready CONFIG="$(CONFIG)" READY_TIMEOUT="$(READY_TIMEOUT)"; \

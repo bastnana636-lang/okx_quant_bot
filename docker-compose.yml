@@ -10,18 +10,19 @@ services:
     env_file:
       - .compose.env
     environment:
-      - HTTP_PROXY=http://host.docker.internal:7897
-      - HTTPS_PROXY=http://host.docker.internal:7897
+      # Set OKX_HTTP_PROXY in .compose.env. Leave it empty to connect directly.
       # aiohttp selects proxy variables by URL scheme; HTTPS_PROXY alone does not cover wss://.
-      - WS_PROXY=http://host.docker.internal:7897
-      - WSS_PROXY=http://host.docker.internal:7897
-      - ALL_PROXY=http://host.docker.internal:7897
+      - HTTP_PROXY=${OKX_HTTP_PROXY:-}
+      - HTTPS_PROXY=${OKX_HTTP_PROXY:-}
+      - WS_PROXY=${OKX_HTTP_PROXY:-}
+      - WSS_PROXY=${OKX_HTTP_PROXY:-}
+      - ALL_PROXY=${OKX_HTTP_PROXY:-}
       - NO_PROXY=localhost,127.0.0.1
-      - http_proxy=http://host.docker.internal:7897
-      - https_proxy=http://host.docker.internal:7897
-      - ws_proxy=http://host.docker.internal:7897
-      - wss_proxy=http://host.docker.internal:7897
-      - all_proxy=http://host.docker.internal:7897
+      - http_proxy=${OKX_HTTP_PROXY:-}
+      - https_proxy=${OKX_HTTP_PROXY:-}
+      - ws_proxy=${OKX_HTTP_PROXY:-}
+      - wss_proxy=${OKX_HTTP_PROXY:-}
+      - all_proxy=${OKX_HTTP_PROXY:-}
       - no_proxy=localhost,127.0.0.1
     volumes:
       - ./conf:/home/hummingbot/conf

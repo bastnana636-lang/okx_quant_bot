@@ -54,14 +54,16 @@ quant_okx_trader/
 ├── data/                      # 运行时数据 (status.json 状态快照, sqlite 数据库)
 ├── hummingbot/                # Hummingbot 核心引擎与 OKX 永续合约连接器
 ├── logs/                      # 策略运行日志
-├── scripts/                   # 启动前自检与就绪检查脚本 (validate_mean_reversion 等)
+├── scripts/                   # 首次配置、启动前自检与就绪检查
+│   ├── ensure_setup.py        # 首次运行写入本机密码与加密 OKX API
+│   └── write_okx_keys.py      # 在容器内加密 API，不把明文写入仓库
 ├── strategy_configs/          # 策略模板副本 (纳入 Git 版本管理)
 ├── test/                      # 单元测试与策略集成测试
 ├── Dockerfile                 # 生产容器构建定义
 ├── docker-compose.yml         # Docker 编排配置
 ├── Makefile                   # 统一命令入口
 ├── MEAN_REVERSION.md          # 均值回归策略深度原理与排查手册
-└── README_CN.md               # 中文说明文档
+└── README.md                  # 中文说明文档
 ```
 
 ---
@@ -83,7 +85,7 @@ quant_okx_trader/
 | **UNI-USDT** | 78.75 | 3x | 2.0 ~ 3.5 | 0.4 | 0.75 USDT | 1.5x |
 | **ADA-USDT** | 78.75 | 3x | 2.0 ~ 3.5 | 0.4 | 0.75 USDT | 1.5x |
 
-> 参数模板统一归档于 `strategy_configs/okx_mean_reversion/`，可在实盘修改 `conf/controllers/` 对应文件即时调优。
+> 参数模板统一归档于 `strategy_configs/okx_mean_reversion/`。实盘参数以 `conf/controllers/` 为准，可在监控面板的 **CONFIG** 页修改；保存后需要重启策略才会生效。
 
 ---
 
@@ -91,20 +93,44 @@ quant_okx_trader/
 
 ### 1. 准备工作
 - 安装 [Docker](https://www.docker.com/) 与 Docker Compose。
-- 确保具备 OKX API Key（包含合约交易读取与下单权限）。
-- 配置代理（若处在网络受限环境）：已在 `docker-compose.yml` 中默认配置 Docker 宿主机代理通道。
+- 准备 OKX API Key、Secret Key 和 Passphrase（需要合约交易的读取与下单权限）。
+- 若本机需要代理才能访问 OKX，准备代理地址。容器里访问宿主机代理时使用 `http://host.docker.internal:端口`，例如 `http://host.docker.internal:7897`。留空则直连。
 
-### 2. 启动机器人
-在项目根目录下直接运行：
+### 2. 首次配置
+在项目根目录运行：
+
 ```bash
 make start
 ```
-该命令会自动完成：
+
+如果本机还没有密钥库和 OKX API，启动前会在终端询问一次：
+
+1. 密钥库密码（用来加密 API，请自行保管）；
+2. OKX API Key、Secret Key、Passphrase；
+3. 可选的 HTTP 代理。
+
+这些内容写入本机，且被 Git 忽略：
+
+| 内容 | 位置 |
+| :--- | :--- |
+| 密钥库密码、代理 | `.compose.env` |
+| 密码校验 | `conf/.password_verification` |
+| 加密后的 OKX API | `conf/connectors/okx_perpetual.yml` |
+
+之后再执行 `make start` 不会重复询问。更换 API 时运行：
+
+```bash
+python3 scripts/ensure_setup.py --replace-keys
+```
+
+### 3. 启动机器人
+配置完成后，`make start` 会自动完成：
+
 1. 后台启动 Hummingbot 容器；
-2. 校验 10 组交易对控制器配置与参数模型；
+2. 校验已启用交易对的控制器配置与参数模型；
 3. 加载并启动多币种策略；
 4. 轮询各品种 K 线与行情连接就绪状态；
-5. 自动启动 Web 实时监控看板并在浏览器打开。
+5. 自动启动 Web 监控面板并在浏览器打开。
 
 ---
 
@@ -112,27 +138,45 @@ make start
 
 | 命令 | 描述 |
 | :--- | :--- |
-| `make start` | 一键启动容器、校验参数、启动策略并打开监控面板 |
+| `make start` | 首次运行时完成本机配置，然后启动容器、校验参数、启动策略并打开监控面板 |
 | `make stop` | 优雅停止策略（不撤销已有交易所保护订单） |
 | `make status` | 终端打印各交易对实时信号、持仓、已实现与未实现盈亏 |
 | `make logs` | 实时跟踪策略容器输出日志 |
 | `make wait-ready` | 检查各交易对 K 线订阅与 OKX 账户 WebSocket 连接进度 |
 | `make dashboard` | 单独启动本地 Web 监控面板（默认端口 `8888`） |
 | `make stop-dashboard` | 停止本地 Web 监控面板服务 |
-| `make test` | 执行本地全套策略单元测试（106 项测试） |
+| `make test` | 执行本地全套策略单元测试 |
+| `python3 scripts/ensure_setup.py --replace-keys` | 重新输入并覆盖本机 OKX API |
 
 ---
 
 ## 实时监控面板 (Dashboard)
 
 - **访问地址**：[http://127.0.0.1:8888](http://127.0.0.1:8888)
-- **技术实现**：基于 Python 标准库 `http.server`，纯前端 HTML/CSS/Vanilla JS 局部局部无刷新更新，每 3 秒自动轮询数据差量。
-- **展示板块**：
-  1. **资产概览**：实盘 USDT 可用余额、运行时长、全球累计 PnL、整体收益率。
-  2. **信号与绩效监控表**：各品种当前实时 Z-Score、信号建议方向（BUY/SELL）、当前阶段状态、累计交易量。
-  3. **实时持仓与活跃挂单**：合约开仓价、标记价、未实现盈亏、挂单持续时间。
-  4. **执行历史跟踪**：显示最近执行器的平仓原因（TAKE_PROFIT / STOP_LOSS / EARLY_STOP）。
-  5. **实盘日志流**：展示最新关键日志，智能高亮 WARNING 与 ERROR。
+- **页面**：顶栏有三个入口，**DASHBOARD**、**MARKETS**、**CONFIG**。
+- **技术实现**：基于 Python 标准库 `http.server`。监控页用纯前端局部更新，每 3 秒轮询一次。
+
+### DASHBOARD
+
+1. **资产概览**：实盘 USDT 可用余额、运行时长、全球累计 PnL、整体收益率。
+2. **信号与绩效监控表**：各品种当前实时 Z-Score、信号建议方向（BUY/SELL）、当前阶段状态、累计交易量。
+3. **实时持仓与活跃挂单**：合约开仓价、标记价、未实现盈亏、挂单持续时间。
+4. **执行历史跟踪**：显示最近执行器的平仓原因（TAKE_PROFIT / STOP_LOSS / EARLY_STOP）。
+5. **实盘日志流**：展示最新关键日志，智能高亮 WARNING 与 ERROR。
+
+### MARKETS
+
+只展示当前策略交易对的 OKX 永续公开行情：最新价、24 小时涨跌、买卖价、点差和成交额。
+
+### CONFIG
+
+用来修改实盘参数，写入 `conf/controllers/` 里当前启用的控制器：
+
+- **杠杆**：默认 3，允许 1 到 5。可以用「应用到全部币种」，也可以按币种单独填写。
+- **开单金额**：每个币种的单笔最大名义本金（USDT）。
+- **现金止盈**，以及 Z-Score、止损、冷静期等策略参数。策略参数保存后对全部已启用币种统一生效。
+
+正在运行的策略不会热加载这些文件。保存后执行 `make stop && make start` 才会用上新参数。CONFIG 页不显示、也不修改 API 密钥。
 
 ---
 
@@ -158,12 +202,13 @@ python3 -m pytest -q test/strategy_unit
 ```
 执行结果示例：
 ```text
-106 passed, 2 warnings in 6.09s
+113 passed, 2 warnings
 ```
 
 ---
 
 ## 安全提示
 
-- **API 凭证隔离**：OKX API 密钥存储于 `conf/connectors/okx_perpetual.yml`，已被根目录与配置级 `.gitignore` 彻底屏蔽，**严禁上传到公共代码仓库**。
+- **API 凭证隔离**：OKX API 经密钥库密码加密后存放在 `conf/connectors/okx_perpetual.yml`。密码和代理在 `.compose.env`。这两处都被 Git 忽略，**不要提交，也不要发给别人**。拿到仓库副本的人没有你的密码和 API，无法直接交易。
+- **本机密码等于启动钥匙**：它保存在本机是为了后续启动不用重复输入。能读取该文件的人可以启动机器人。
 - **实盘前测试**：建议在真实资金介入前，使用小额名义本金进行充分的观察与验证。

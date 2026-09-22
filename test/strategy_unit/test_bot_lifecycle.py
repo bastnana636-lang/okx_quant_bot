@@ -73,16 +73,16 @@ def test_real_failures_are_not_suppressed(fake_docker, options):
 
 
 def test_start_waits_for_readiness_and_propagates_timeout(fake_docker):
-    result, calls = fake_docker("start", WAIT_EXIT="5")
+    result, calls = fake_docker("start", WAIT_EXIT="5", SKIP_SETUP="1", HBOT_PASSWORD="test")
     assert result.returncode != 0
-    assert calls[0] == ["compose", "up", "-d", "hummingbot"]
+    assert calls[0] == ["compose", "--env-file", ".compose.env", "up", "-d", "hummingbot"]
     assert "scripts.validate_mean_reversion" in calls[1]
     assert calls[2][-5:] == ["hbot", "start", CONFIG, "--v2-script", "--replace"]
     assert calls[3] == ["exec", "-i", "hummingbot", "python", "-", "--config", CONFIG, "--timeout", "120"]
 
 
 def test_failed_validation_does_not_start_bot(fake_docker):
-    result, calls = fake_docker("start", VALIDATE_EXIT="1")
+    result, calls = fake_docker("start", VALIDATE_EXIT="1", SKIP_SETUP="1", HBOT_PASSWORD="test")
     assert result.returncode != 0
     assert len(calls) == 2
 
