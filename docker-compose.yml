@@ -75,5 +75,5 @@ services:
      - "./gateway-files/logs:/home/gateway/logs"
      - "./certs:/home/gateway/certs"
    environment:
-     - GATEWAY_PASSPHRASE='Wj20060306!'
+     - GATEWAY_PASSPHRASE=${GATEWAY_PASSPHRASE:?Set GATEWAY_PASSPHRASE in .env}
      - DEV=true
