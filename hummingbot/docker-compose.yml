@@ -1,0 +1,77 @@
+services:
+  hummingbot:
+    container_name: hummingbot
+    image: hummingbot/hummingbot:latest
+    # build: # Uncomment this build section and comment image to build Hummingbot locally
+    #   context: .
+    #   dockerfile: Dockerfile
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .compose.env
+    environment:
+      - HTTP_PROXY=http://host.docker.internal:7897
+      - HTTPS_PROXY=http://host.docker.internal:7897
+      # aiohttp selects proxy variables by URL scheme; HTTPS_PROXY alone does not cover wss://.
+      - WS_PROXY=http://host.docker.internal:7897
+      - WSS_PROXY=http://host.docker.internal:7897
+      - ALL_PROXY=http://host.docker.internal:7897
+      - NO_PROXY=localhost,127.0.0.1
+      - http_proxy=http://host.docker.internal:7897
+      - https_proxy=http://host.docker.internal:7897
+      - ws_proxy=http://host.docker.internal:7897
+      - wss_proxy=http://host.docker.internal:7897
+      - all_proxy=http://host.docker.internal:7897
+      - no_proxy=localhost,127.0.0.1
+    volumes:
+      - ./conf:/home/hummingbot/conf
+      - ./conf/connectors:/home/hummingbot/conf/connectors
+      - ./conf/strategies:/home/hummingbot/conf/strategies
+      - ./conf/controllers:/home/hummingbot/conf/controllers
+      - ./conf/scripts:/home/hummingbot/conf/scripts
+      - ./logs:/home/hummingbot/logs
+      - ./data:/home/hummingbot/data
+      - ./certs:/home/hummingbot/certs
+      # Colima must mount /Users/Files (configured in ~/.colima/default/colima.yaml).
+      # File mounts retain the image's other strategies while loading our local implementation.
+      - ./controllers/market_making/pmm_simple.py:/home/hummingbot/controllers/market_making/pmm_simple.py:ro
+      - ./controllers/market_making/mean_reversion.py:/home/hummingbot/controllers/market_making/mean_reversion.py:ro
+      - ./scripts/validate_mean_reversion.py:/home/hummingbot/scripts/validate_mean_reversion.py:ro
+      - ./hummingbot/connector/derivative/okx_perpetual/okx_perpetual_user_stream_data_source.py:/home/hummingbot/hummingbot/connector/derivative/okx_perpetual/okx_perpetual_user_stream_data_source.py:ro
+      - ./hummingbot/connector/derivative/okx_perpetual/okx_perpetual_derivative.py:/home/hummingbot/hummingbot/connector/derivative/okx_perpetual/okx_perpetual_derivative.py:ro
+      - ./hummingbot/connector/perpetual_derivative_py_base.py:/home/hummingbot/hummingbot/connector/perpetual_derivative_py_base.py:ro
+      - ./hummingbot/core/data_type/order_book_tracker.py:/home/hummingbot/hummingbot/core/data_type/order_book_tracker.py:ro
+      - ./hummingbot/strategy_v2/executors/position_executor/data_types.py:/home/hummingbot/hummingbot/strategy_v2/executors/position_executor/data_types.py:ro
+      - ./hummingbot/strategy_v2/executors/position_executor/position_executor.py:/home/hummingbot/hummingbot/strategy_v2/executors/position_executor/position_executor.py:ro
+      - ./hummingbot/core/web_assistant/connections/connections_factory.py:/home/hummingbot/hummingbot/core/web_assistant/connections/connections_factory.py:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    tty: true
+    stdin_open: true
+    # network_mode: host  # Linux-only; Colima on macOS uses default bridge
+    # init: true runs a real init (tini) as PID 1 so it REAPS exited children — needed when a bot is
+    # started with `docker exec … hbot start`: it reparents to PID 1 when the exec returns, and without
+    # an init it lingers as a zombie that makes `hbot stop` wait its full timeout. Harmless otherwise.
+    init: true
+    # Keep the container idle so we can drive it with `hbot` instead of the TUI.
+    command: tail -f /dev/null
+    # Or make one dedicated bot the container's main process:
+    #   command: hbot start <config> --foreground
+
+  gateway:
+   profiles: ["gateway"]
+   restart: always
+   container_name: gateway
+   image: hummingbot/gateway:latest
+   ports:
+     - "15888:15888"
+   volumes:
+     - "./gateway-files/conf:/home/gateway/conf"
+     - "./gateway-files/logs:/home/gateway/logs"
+     - "./certs:/home/gateway/certs"
+   environment:
+     - GATEWAY_PASSPHRASE='Wj20060306!'
+     - DEV=true
