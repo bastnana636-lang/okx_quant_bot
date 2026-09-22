@@ -55,6 +55,8 @@ dashboard/*.log
 # Distribution files
 /build
 /dist
+/build/native-macos
+/build/windows
 /src
 /*.egg-info
 *.whl

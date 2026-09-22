@@ -7,11 +7,12 @@ comments and key order.
 
 from __future__ import annotations
 
+import os
 import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(os.environ.get("OKX_TRADER_ROOT", Path(__file__).resolve().parents[1])).resolve()
 SCRIPT_FILE = ROOT / "conf" / "scripts" / "conf_okx_multi.yml"
 CONTROLLERS_DIR = ROOT / "conf" / "controllers"
 

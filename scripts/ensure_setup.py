@@ -14,11 +14,12 @@ import getpass
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(os.environ.get("OKX_TRADER_ROOT", Path(__file__).resolve().parents[1])).resolve()
 COMPOSE_ENV = ROOT / ".compose.env"
 PASSWORD_FILE = ROOT / "conf" / ".password_verification"
 CONNECTOR_FILE = ROOT / "conf" / "connectors" / "okx_perpetual.yml"
@@ -42,7 +43,7 @@ def parse_env(text: str) -> dict[str, str]:
 
 
 def render_env(env: dict[str, str]) -> str:
-    order = ["COMPOSE_PROFILES", "HBOT_PASSWORD", "OKX_HTTP_PROXY"]
+    order = ["COMPOSE_PROFILES", "HBOT_PASSWORD", "OKX_HTTP_PROXY", "GATEWAY_PASSPHRASE"]
     lines = []
     seen = set()
     for key in order + [key for key in env if key not in order]:
@@ -109,7 +110,7 @@ def _prompt_proxy() -> str:
 
 def collect_missing(status: dict[str, bool], replace_keys: bool) -> dict[str, str]:
     if not sys.stdin.isatty():
-        raise SystemExit("首次配置需要在终端中运行 make start")
+        raise SystemExit("首次配置需要在交互式终端中运行启动程序")
     print("首次配置只需做一次。密码和 OKX API 保存在本机，不会写入 Git。")
     print("之后启动会自动读取，不需要再次输入。")
     collected = {}
@@ -176,6 +177,10 @@ def install_keys(password: str, keys: dict[str, str]) -> None:
 def ensure(replace_keys: bool = False) -> dict[str, str]:
     env = load_compose_env()
     env.setdefault("COMPOSE_PROFILES", "")
+    env_changed = False
+    if not env.get("GATEWAY_PASSPHRASE"):
+        env["GATEWAY_PASSPHRASE"] = secrets.token_urlsafe(24)
+        env_changed = True
     keystore_exists = PASSWORD_FILE.is_file()
     connector_exists = CONNECTOR_FILE.is_file()
     status = setup_status(env, keystore_exists, connector_exists)
@@ -201,10 +206,13 @@ def ensure(replace_keys: bool = False) -> dict[str, str]:
         if "okx_perpetual_api_key" in collected:
             install_keys(password, collected)
         print("本机配置已保存。后续启动不会再次询问密码和 OKX API。")
-    elif "OKX_HTTP_PROXY" not in env:
-        # Existing installs used the compose file's fixed local proxy.
-        env["OKX_HTTP_PROXY"] = LEGACY_PROXY
-        save_compose_env(env)
+    else:
+        if "OKX_HTTP_PROXY" not in env:
+            # Existing installs used the compose file's fixed local proxy.
+            env["OKX_HTTP_PROXY"] = LEGACY_PROXY
+            env_changed = True
+        if env_changed:
+            save_compose_env(env)
     return load_compose_env()
 
 
@@ -218,7 +226,7 @@ def main() -> None:
     if args.shell_exports:
         env = load_compose_env()
         if needs_setup(setup_status(env, PASSWORD_FILE.is_file(), CONNECTOR_FILE.is_file())):
-            raise SystemExit("本机配置尚未完成，请先运行 make start")
+            raise SystemExit("本机配置尚未完成，请先运行启动程序")
         print(shell_exports(env))
         return
     ensure(replace_keys=args.replace_keys)

@@ -27,7 +27,7 @@ except ImportError:  # imported as dashboard.dashboard
     from dashboard.strategy_config import SHARED_FIELDS, ConfigError, apply_config, load_config
 
 # ─── 路径配置 ────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent.parent
+BASE_DIR = Path(os.environ.get("OKX_TRADER_ROOT", Path(__file__).parent.parent)).resolve()
 STATUS_FILE = BASE_DIR / "data" / "bot" / "status.json"
 LOG_FILE    = BASE_DIR / "logs" / "logs_conf_okx_multi.log"
 PORT        = 8888
@@ -1262,7 +1262,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {
                 "ok": True,
                 "files": written["files"],
-                "message": "已写入 conf/controllers。请执行 make stop && make start 后生效。",
+                "message": "已写入 conf/controllers。请停止并重新启动策略后生效。",
             })
         except BrokenPipeError:
             return
@@ -1280,7 +1280,7 @@ def main():
     print(f"   日志文件 : {LOG_FILE}", flush=True)
     print(f"   访问地址 : http://127.0.0.1:{PORT}", flush=True)
     print(f"   按 Ctrl+C 停止", flush=True)
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server = ThreadingHTTPServer((os.environ.get("DASHBOARD_HOST", "127.0.0.1"), PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

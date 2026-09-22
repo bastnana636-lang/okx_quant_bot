@@ -91,12 +91,32 @@ quant_okx_trader/
 
 ## 快速开始
 
-### 1. 准备工作
+### 原生安装包（推荐）
+
+从 [Releases](https://github.com/bastnana636-lang/okx_quant_bot/releases/latest) 下载对应安装包：
+
+- **macOS 12+（Intel / Apple Silicon）**：`OKX-Quant-Trader-*-macOS-Universal.dmg`，打开后把应用拖入“应用程序”，再启动 `OKX Quant Trader`。
+- **Windows 10/11 x64**：`OKX-Quant-Trader-*-Windows-x64-Setup.exe`，安装后从桌面或开始菜单启动。
+
+安装包会提供系统原生入口，自动执行首次配置、启动策略并打开 Dashboard。交易引擎仍运行在 Linux 容器中，因此两个平台都需要先安装并启动 [Docker Desktop](https://www.docker.com/products/docker-desktop/)；Windows 必须使用 Linux containers 模式，不再需要手动安装 Make、Bash、WSL 或 Python。
+
+当前安装包未使用 Apple Developer ID 或 Windows Authenticode 证书签名。macOS 首次打开时可在 Finder 中右键应用并选择“打开”；Windows 若显示 SmartScreen，请核对下载来源为本仓库 Release 后选择继续运行。
+
+本机配置与日志不会随升级或卸载自动删除：
+
+| 平台 | 本机数据目录 |
+| :--- | :--- |
+| macOS | `~/Library/Application Support/OKX Quant Trader` |
+| Windows | `%LOCALAPPDATA%\OKX Quant Trader` |
+
+### 从源码运行
+
+#### 1. 准备工作
 - 安装 [Docker](https://www.docker.com/) 与 Docker Compose。
 - 准备 OKX API Key、Secret Key 和 Passphrase（需要合约交易的读取与下单权限）。
 - 若本机需要代理才能访问 OKX，准备代理地址。容器里访问宿主机代理时使用 `http://host.docker.internal:端口`，例如 `http://host.docker.internal:7897`。留空则直连。
 
-### 2. 首次配置
+#### 2. 首次配置
 在项目根目录运行：
 
 ```bash
@@ -123,7 +143,7 @@ make start
 python3 scripts/ensure_setup.py --replace-keys
 ```
 
-### 3. 启动机器人
+#### 3. 启动机器人
 配置完成后，`make start` 会自动完成：
 
 1. 后台启动 Hummingbot 容器；
