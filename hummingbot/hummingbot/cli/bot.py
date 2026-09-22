@@ -5,7 +5,7 @@ There is no instance registry: an install runs at most one ``hbot`` bot. Its run
     data/bot/
         meta.json     # config, type, name, db_path, started_at (db_path recorded once running)
         bot.pid       # pid of the detached engine process
-        status.json   # latest on-demand snapshot written by the engine (SIGUSR1)
+        status.json   # latest snapshot written by the engine (timer + SIGUSR1)
         bot.log       # child stdout/stderr (pre-logging + uncaught only; the structured log is primary)
 
 The trades sqlite DB and the structured log are Hummingbot's own (``data/<name>.sqlite``,

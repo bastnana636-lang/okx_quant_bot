@@ -1,5 +1,5 @@
 .ONESHELL:
-.PHONY: test run run_coverage report_coverage development-diff-cover uninstall build install setup deploy down link-cli start stop status logs wait-ready
+.PHONY: test run run_coverage report_coverage development-diff-cover uninstall build install setup deploy down link-cli start stop status logs wait-ready dashboard stop-dashboard
 
 DYDX ?= 0
 ENV_FILE := setup/environment.yml
@@ -108,7 +108,8 @@ start:
 	docker compose up -d hummingbot; \
 	docker exec hummingbot python -m scripts.validate_mean_reversion --config "$(CONFIG)"; \
 	docker exec -e HBOT_PASSWORD="$$HBOT_PASSWORD" hummingbot hbot start "$(CONFIG)" --v2-script --replace; \
-	$(MAKE) wait-ready CONFIG="$(CONFIG)" READY_TIMEOUT="$(READY_TIMEOUT)"
+	$(MAKE) wait-ready CONFIG="$(CONFIG)" READY_TIMEOUT="$(READY_TIMEOUT)"; \
+	$(MAKE) dashboard
 
 wait-ready:
 	@docker exec -i hummingbot python - --config "$(CONFIG)" --timeout "$(READY_TIMEOUT)" < scripts/wait_for_bot_ready.py
@@ -121,3 +122,40 @@ status:
 
 logs:
 	docker exec -it hummingbot hbot logs -f
+
+DASHBOARD_PORT ?= 8888
+DASHBOARD_LOG  := ../dashboard/dashboard.log
+DASHBOARD_PID  := ../dashboard/dashboard.pid
+
+dashboard:
+	@DASHBOARD_DIR="$$(cd .. && pwd)/dashboard"; \
+	DASHBOARD_PY="$$DASHBOARD_DIR/dashboard.py"; \
+	DASHBOARD_PID="$$DASHBOARD_DIR/dashboard.pid"; \
+	DASHBOARD_LOG="$$DASHBOARD_DIR/dashboard.log"; \
+	if lsof -ti tcp:$(DASHBOARD_PORT) >/dev/null 2>&1; then \
+		echo "📊 Dashboard 已在运行  http://127.0.0.1:$(DASHBOARD_PORT)"; \
+	else \
+		rm -f "$$DASHBOARD_PID"; \
+		PATH="/opt/homebrew/bin:/usr/local/bin:$$PATH" PYTHONUNBUFFERED=1 \
+			nohup python3 -u "$$DASHBOARD_PY" > "$$DASHBOARD_LOG" 2>&1 & \
+		echo $$! > "$$DASHBOARD_PID"; \
+		disown $$! 2>/dev/null || true; \
+		sleep 1; \
+		echo "📊 Dashboard 已启动 (PID=$$(cat "$$DASHBOARD_PID"))"; \
+		echo "   访问地址: http://127.0.0.1:$(DASHBOARD_PORT)"; \
+		echo "   日志文件: $$DASHBOARD_LOG"; \
+	fi; \
+	open "http://127.0.0.1:$(DASHBOARD_PORT)" 2>/dev/null || true
+
+stop-dashboard:
+	@DASHBOARD_DIR="$$(cd .. && pwd)/dashboard"; \
+	DASHBOARD_PID="$$DASHBOARD_DIR/dashboard.pid"; \
+	PIDS="$$(lsof -ti tcp:$(DASHBOARD_PORT) 2>/dev/null)"; \
+	if [ -n "$$PIDS" ]; then \
+		echo "$$PIDS" | xargs kill; \
+		rm -f "$$DASHBOARD_PID"; \
+		echo "📊 Dashboard 已停止"; \
+	else \
+		echo "📊 Dashboard 未在运行"; \
+		rm -f "$$DASHBOARD_PID"; \
+	fi

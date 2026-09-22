@@ -1,11 +1,10 @@
 """The detached bot engine (the child process spawned by ``hbot start``).
 
 Unlike ``HummingbotApplication.run_headless()`` — which mandates an MQTT broker — this engine
-keeps the process alive with its own loop. Status is computed **on demand**: the engine writes a
-fresh ``status.json`` only when it receives SIGUSR1 (sent by ``hbot status``), plus once at
-startup (so ``hbot start`` can detect readiness) and once on shutdown. There is no polling
-interval — the agent decides how often to query. On SIGTERM/SIGINT it stops the strategy
-gracefully (cancelling open orders) and shuts down.
+keeps the process alive with its own loop. Status is written to ``status.json`` on a short timer
+(so a dashboard can stay current without ``hbot status``), plus on SIGUSR1, once at startup (so
+``hbot start`` can detect readiness), and once on shutdown. On SIGTERM/SIGINT it stops the
+strategy gracefully (cancelling open orders) and shuts down.
 
 Invoked as: ``python -m hummingbot.cli.engine --name <name> [--config f | --script-config c]``
 The password is passed via the ``HBOT_PASSWORD`` env var (never argv).
@@ -32,6 +31,8 @@ from hummingbot.client.runner import (
 )
 
 BALANCE_TIMEOUT = 10.0
+# Fresh status.json for dashboards / `hbot status` without requiring a SIGUSR1 each time.
+SNAPSHOT_INTERVAL_S = 5.0
 
 
 async def _collect_balances(hb: HummingbotApplication) -> Dict[str, Dict[str, float]]:
@@ -80,21 +81,41 @@ async def _write_snapshot(hb: HummingbotApplication, name: str, *, running: bool
 async def _serve(hb: HummingbotApplication, name: str) -> None:
     """Keep the process alive until a stop signal arrives.
 
-    Status snapshots are written on demand (SIGUSR1 from ``hbot status``), not on a timer.
+    Status snapshots are written on a timer and also on demand (SIGUSR1 from ``hbot status``).
     """
     loop = asyncio.get_event_loop()
     stop_event = asyncio.Event()
+    write_lock = asyncio.Lock()
+
+    async def _safe_write(*, running: bool) -> None:
+        async with write_lock:
+            await _write_snapshot(hb, name, running=running)
+
+    async def _periodic_snapshot() -> None:
+        while True:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=SNAPSHOT_INTERVAL_S)
+                return
+            except asyncio.TimeoutError:
+                await _safe_write(running=True)
+
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop_event.set)
     loop.add_signal_handler(
         signal.SIGUSR1,
-        lambda: loop.create_task(_write_snapshot(hb, name, running=True)))
+        lambda: loop.create_task(_safe_write(running=True)))
 
     # Initial snapshot so `hbot start` can detect readiness.
-    await _write_snapshot(hb, name, running=True)
+    await _safe_write(running=True)
+    periodic = asyncio.create_task(_periodic_snapshot())
     try:
         await stop_event.wait()
     finally:
+        periodic.cancel()
+        try:
+            await periodic
+        except asyncio.CancelledError:
+            pass
         logging.getLogger().info("Stop requested — winding down strategy and cancelling orders.")
         try:
             await hb.stop_loop()
@@ -104,7 +125,7 @@ async def _serve(hb: HummingbotApplication, name: str) -> None:
             await hb.trading_core.shutdown()
         except Exception:
             logging.getLogger().error("Error during shutdown.", exc_info=True)
-        await _write_snapshot(hb, name, running=False)
+        await _safe_write(running=False)
         bot.clear_pid()
 
 

@@ -1,3 +1,12 @@
 *.yml
 *.json
 .password_verification
+
+# Allow controllers and scripts configs to be tracked
+!controllers/
+!controllers/*.yml
+!scripts/
+!scripts/*.yml
+!conf_client.yml
+!conf_fee_overrides.yml
+!hummingbot_logs.yml

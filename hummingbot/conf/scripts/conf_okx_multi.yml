@@ -1,0 +1,12 @@
+script_file_name: v2_with_controllers.py
+controllers_config:
+  - conf_okx_pmm_btc.yml
+  - conf_okx_pmm_eth.yml
+  - conf_okx_pmm_sol.yml
+  - conf_okx_pmm_xrp.yml
+  - conf_okx_pmm_doge.yml
+  - conf_okx_pmm_sui.yml
+  - conf_okx_pmm_sndk.yml
+  - conf_okx_pmm_zec.yml
+  - conf_okx_pmm_uni.yml
+  - conf_okx_pmm_ada.yml

@@ -262,16 +262,16 @@ def test_every_local_config_loads_and_only_uses_new_parameters(policy):
 def test_active_configs_use_scaled_notional_and_cash_take_profit(policy):
     script = yaml.safe_load((ROOT / 'conf/scripts/conf_okx_multi.yml').read_text())
     expected = {
-        'conf_okx_pmm_btc.yml': D('120'),
-        'conf_okx_pmm_eth.yml': D('75'),
-        'conf_okx_pmm_sol.yml': D('52.5'),
-        'conf_okx_pmm_xrp.yml': D('52.5'),
-        'conf_okx_pmm_doge.yml': D('52.5'),
-        'conf_okx_pmm_sui.yml': D('52.5'),
-        'conf_okx_pmm_one.yml': D('52.5'),
-        'conf_okx_pmm_zec.yml': D('52.5'),
-        'conf_okx_pmm_uni.yml': D('52.5'),
-        'conf_okx_pmm_ada.yml': D('52.5'),
+        'conf_okx_pmm_btc.yml': D('180'),
+        'conf_okx_pmm_eth.yml': D('112.5'),
+        'conf_okx_pmm_sol.yml': D('78.75'),
+        'conf_okx_pmm_xrp.yml': D('78.75'),
+        'conf_okx_pmm_doge.yml': D('78.75'),
+        'conf_okx_pmm_sui.yml': D('78.75'),
+        'conf_okx_pmm_sndk.yml': D('78.75'),
+        'conf_okx_pmm_zec.yml': D('78.75'),
+        'conf_okx_pmm_uni.yml': D('78.75'),
+        'conf_okx_pmm_ada.yml': D('78.75'),
     }
     assert set(script['controllers_config']) == set(expected)
     for name, amount in expected.items():
@@ -279,4 +279,4 @@ def test_active_configs_use_scaled_notional_and_cash_take_profit(policy):
         template = policy.PMMSimpleConfig(**yaml.safe_load(
             (ROOT / 'strategy_configs/okx_mean_reversion' / name).read_text()))
         assert runtime.total_amount_quote == template.total_amount_quote == amount
-        assert runtime.take_profit_quote == template.take_profit_quote == D('.5')
+        assert runtime.take_profit_quote == template.take_profit_quote == D('.75')

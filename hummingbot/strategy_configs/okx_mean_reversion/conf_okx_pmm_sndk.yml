@@ -1,9 +1,9 @@
 # Pure mean reversion. total_amount_quote is the maximum position notional in USDT.
-id: okx_pmm_xrp
+id: okx_pmm_sndk
 controller_name: pmm_simple
 controller_type: market_making
 connector_name: okx_perpetual
-trading_pair: XRP-USDT
+trading_pair: SNDK-USDT
 total_amount_quote: 78.75
 leverage: 3
 position_mode: ONEWAY

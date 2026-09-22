@@ -44,6 +44,7 @@ services:
       - ./hummingbot/strategy_v2/executors/position_executor/data_types.py:/home/hummingbot/hummingbot/strategy_v2/executors/position_executor/data_types.py:ro
       - ./hummingbot/strategy_v2/executors/position_executor/position_executor.py:/home/hummingbot/hummingbot/strategy_v2/executors/position_executor/position_executor.py:ro
       - ./hummingbot/core/web_assistant/connections/connections_factory.py:/home/hummingbot/hummingbot/core/web_assistant/connections/connections_factory.py:ro
+      - ./hummingbot/cli/engine.py:/home/hummingbot/hummingbot/cli/engine.py:ro
     logging:
       driver: "json-file"
       options:
