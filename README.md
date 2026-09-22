@@ -113,15 +113,24 @@ quant_okx_trader/
 
 #### 1. 准备工作
 - 安装 [Docker](https://www.docker.com/) 与 Docker Compose。
+- 从源码运行需安装 Python 3.11 或更高版本；原生安装包已内置启动器，不需要单独安装 Python。
 - 准备 OKX API Key、Secret Key 和 Passphrase（需要合约交易的读取与下单权限）。
 - 若本机需要代理才能访问 OKX，准备代理地址。容器里访问宿主机代理时使用 `http://host.docker.internal:端口`，例如 `http://host.docker.internal:7897`。留空则直连。
 
 #### 2. 首次配置
-在项目根目录运行：
+在项目根目录运行对应平台的原生启动器：
+
+```powershell
+# Windows 10/11
+.\start.cmd
+```
 
 ```bash
-make start
+# macOS 12+
+python3 native/launcher.py start
 ```
+
+启动器会自动检查并启动 Docker Desktop。Linux 或已配置 Make 的开发环境仍可使用 `make start`。
 
 如果本机还没有密钥库和 OKX API，启动前会在终端询问一次：
 
@@ -137,14 +146,20 @@ make start
 | 密码校验 | `conf/.password_verification` |
 | 加密后的 OKX API | `conf/connectors/okx_perpetual.yml` |
 
-之后再执行 `make start` 不会重复询问。更换 API 时运行：
+之后再次启动不会重复询问。更换 API 时运行：
+
+```powershell
+# Windows
+python native/launcher.py replace-keys
+```
 
 ```bash
-python3 scripts/ensure_setup.py --replace-keys
+# macOS
+python3 native/launcher.py replace-keys
 ```
 
 #### 3. 启动机器人
-配置完成后，`make start` 会自动完成：
+配置完成后，平台启动器会自动完成：
 
 1. 后台启动 Hummingbot 容器；
 2. 校验已启用交易对的控制器配置与参数模型；

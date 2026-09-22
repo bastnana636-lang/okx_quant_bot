@@ -8,7 +8,7 @@ on:
       tag:
         description: Existing release tag to build and upload
         required: true
-        default: v1.1.0
+        default: v1.1.1
 
 permissions:
   contents: write

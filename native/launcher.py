@@ -15,7 +15,7 @@ import webbrowser
 from pathlib import Path
 
 APP_NAME = "OKX Quant Trader"
-RELEASE_VERSION = "1.1.0"
+RELEASE_VERSION = "1.1.1"
 CONFIG = "conf_okx_multi.yml"
 READY_TIMEOUT = 120
 RUNTIME_DIRS = {"certs", "data", "gateway-files", "logs"}
@@ -126,20 +126,39 @@ def ensure_docker(timeout: int = 90) -> str:
     if _docker_ready(docker):
         return docker
     print("Docker Desktop 尚未运行，正在启动…", flush=True)
+    desktop_process: subprocess.Popen | None = None
     try:
         if sys.platform == "darwin":
-            subprocess.Popen(["/usr/bin/open", "-a", "Docker"], stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+            desktop_process = subprocess.Popen(
+                ["/usr/bin/open", "-a", "Docker"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         elif os.name == "nt":
             desktop = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Docker" / "Docker" / "Docker Desktop.exe"
-            subprocess.Popen([str(desktop)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            desktop_process = subprocess.Popen(
+                [str(desktop)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
     except OSError:
         pass
+    started_at = time.monotonic()
     deadline = time.monotonic() + timeout
+    next_progress = 10
     while time.monotonic() < deadline:
         if _docker_ready(docker):
             print("Docker Desktop 已就绪。", flush=True)
             return docker
+        elapsed = int(time.monotonic() - started_at)
+        if elapsed >= next_progress:
+            print(f"仍在等待 Docker Desktop… 已等待 {elapsed} 秒（最多 {timeout} 秒）", flush=True)
+            next_progress += 10
+        desktop_exit = desktop_process.poll() if desktop_process is not None else None
+        if desktop_exit not in (None, 0) and elapsed >= 5:
+            raise LauncherError(
+                "Docker Desktop 启动后立即退出。请先确认代理软件和 Docker Desktop 可正常运行。"
+            )
         time.sleep(2)
     raise LauncherError("Docker Desktop 启动超时。请确认 Docker 使用 Linux containers 后重试。")
 
@@ -179,14 +198,19 @@ def _launcher_command(command: str) -> list[str]:
 def start_dashboard(root: Path) -> None:
     if port_open():
         print("Dashboard 已在运行：http://127.0.0.1:8888", flush=True)
-        webbrowser.open("http://127.0.0.1:8888")
+        if os.environ.get("OKX_TRADER_NO_BROWSER") != "1":
+            webbrowser.open("http://127.0.0.1:8888")
         return
     log_path = root / "dashboard" / "dashboard.log"
     pid_path = root / "dashboard" / "dashboard.pid"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_handle = log_path.open("a", encoding="utf-8")
+    child_env = os.environ.copy()
+    # A detached Windows process otherwise inherits the active OEM/GBK encoding.
+    # The dashboard prints Unicode status markers during startup, so force UTF-8.
+    child_env["PYTHONIOENCODING"] = "utf-8"
     kwargs: dict = {"cwd": root, "stdout": log_handle, "stderr": subprocess.STDOUT,
-                    "stdin": subprocess.DEVNULL, "env": os.environ.copy()}
+                    "stdin": subprocess.DEVNULL, "env": child_env}
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     else:
@@ -200,8 +224,11 @@ def start_dashboard(root: Path) -> None:
         if process.poll() is not None:
             raise LauncherError(f"Dashboard 启动失败，请查看 {log_path}")
         time.sleep(0.2)
+    else:
+        raise LauncherError(f"Dashboard 启动超时，请查看 {log_path}")
     print("Dashboard 已启动：http://127.0.0.1:8888", flush=True)
-    webbrowser.open("http://127.0.0.1:8888")
+    if os.environ.get("OKX_TRADER_NO_BROWSER") != "1":
+        webbrowser.open("http://127.0.0.1:8888")
 
 
 def stop_dashboard(root: Path) -> None:
@@ -222,6 +249,10 @@ def stop_dashboard(root: Path) -> None:
 
 def start_bot() -> int:
     root = prepare()
+    # Keep the local control surface available while Docker starts and while the
+    # strategy warms up.  Previously any Docker/readiness failure prevented the
+    # dashboard from being started at all.
+    start_dashboard(root)
     docker = ensure_docker()
     env = load_environment(root)
     password = env.get("HBOT_PASSWORD", "")
@@ -235,7 +266,6 @@ def start_bot() -> int:
     readiness = (root / "scripts" / "wait_for_bot_ready.py").read_text(encoding="utf-8")
     run([docker, "exec", "-i", "hummingbot", "python", "-", "--config", CONFIG,
          "--timeout", str(READY_TIMEOUT)], root, input_text=readiness)
-    start_dashboard(root)
     print("OKX Quant Trader 已启动。", flush=True)
     return 0
 

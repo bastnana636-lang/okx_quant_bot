@@ -217,7 +217,9 @@ class SpawnDetachedTest(unittest.TestCase):
     def test_ready_bot_returns_the_start_record(self):
         self.fake_time.time.side_effect = [0.0, 1.0]
         self.proc.poll.return_value = None
-        with patch.object(bot, "read_status", return_value={"engine": {"strategy_running": True}}):
+        with patch.object(bot, "read_status", return_value={
+                "pid": 4242, "running": True, "updated_at": 1.0,
+                "engine": {"strategy_running": True}}):
             record = start_mod._spawn_detached(self.cmd, self.env, "n", 60.0)
         self.assertEqual(record, {"name": "n", "pid": 4242, "status": "running"})
         self.write_pid.assert_called_once_with(4242)
@@ -232,7 +234,25 @@ class SpawnDetachedTest(unittest.TestCase):
         self.fake_time.time.side_effect = [0.0, 1.0, 2.0]
         self.proc.poll.return_value = None
         with patch.object(bot, "read_status",
-                          side_effect=[None, {"engine": {"strategy_running": True}}]):
+                          side_effect=[None, {
+                              "pid": 4242, "running": True, "updated_at": 2.0,
+                              "engine": {"strategy_running": True}}]):
+            record = start_mod._spawn_detached(self.cmd, self.env, "n", 60.0)
+        self.assertEqual(record["status"], "running")
+        self.fake_time.sleep.assert_called_once_with(1.0)
+
+    def test_ignores_running_snapshot_from_previous_process(self):
+        self.fake_time.time.side_effect = [10.0, 11.0, 12.0]
+        self.proc.poll.return_value = None
+        stale = {
+            "pid": 107, "running": True, "updated_at": 9.0,
+            "engine": {"strategy_running": True},
+        }
+        fresh = {
+            "pid": 4242, "running": True, "updated_at": 12.0,
+            "engine": {"strategy_running": True},
+        }
+        with patch.object(bot, "read_status", side_effect=[stale, fresh]):
             record = start_mod._spawn_detached(self.cmd, self.env, "n", 60.0)
         self.assertEqual(record["status"], "running")
         self.fake_time.sleep.assert_called_once_with(1.0)

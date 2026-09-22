@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="${1:-1.1.0}"
+VERSION="${1:-1.1.1}"
 TARGET_ARCH="${2:-universal2}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BUILD_ROOT="${ROOT}/build/native-macos"

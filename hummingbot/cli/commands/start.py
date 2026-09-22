@@ -175,6 +175,7 @@ def launch(*, file: Optional[str], v1: bool = False, v2: bool = False, controlle
 def _spawn_detached(cmd: list, env: dict, name: str, timeout: float) -> dict:
     """Launch the engine detached, wait until its strategy is running, and report — or fail with the
     recent log if it exits during startup / times out."""
+    spawned_at = time.time()
     log_handle = open(bot.log_file(), "wb")  # fresh per run (startup/uncaught only)
     proc = subprocess.Popen(
         cmd, cwd=prefix_path(), stdin=subprocess.DEVNULL,
@@ -183,14 +184,18 @@ def _spawn_detached(cmd: list, env: dict, name: str, timeout: float) -> dict:
     bot.write_pid(proc.pid)
     bot.update_meta(pid=proc.pid)
 
-    deadline = time.time() + timeout
+    deadline = spawned_at + timeout
     while time.time() < deadline:
         if proc.poll() is not None:
             bot.clear_pid()
             fail(f"bot exited during startup (rc={proc.returncode}). Recent log:\n{_log_tail()}",
                  ExitCode.ERROR)
-        engine = (bot.read_status() or {}).get("engine") or {}
-        if engine.get("strategy_running"):
+        snapshot = bot.read_status() or {}
+        engine = snapshot.get("engine") or {}
+        if (snapshot.get("pid") == proc.pid
+                and snapshot.get("running") is True
+                and snapshot.get("updated_at", 0) >= spawned_at
+                and engine.get("strategy_running")):
             break
         time.sleep(1.0)
     else:

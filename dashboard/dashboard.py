@@ -15,6 +15,8 @@ import html
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -36,10 +38,63 @@ OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
 TICKER_TTL_S = 5
 _ticker_lock = threading.Lock()
 _ticker_cache: dict = {"fetched_at": 0.0, "by_inst": {}, "error": None}
+_control_lock = threading.Lock()
+_control_process: subprocess.Popen | None = None
+_control_action: str | None = None
 
 
 def _log(msg: str) -> None:
     print(f"[dashboard] {msg}", flush=True)
+
+
+def _launch_control(action: str) -> tuple[bool, str]:
+    """Start one detached launcher control process; credentials stay local."""
+    global _control_action, _control_process
+    labels = {"start": "重新启动", "stop": "停止"}
+    label = labels[action]
+    with _control_lock:
+        if _control_process is not None and _control_process.poll() is None:
+            active_label = labels.get(_control_action or "", "控制操作")
+            return False, f"{active_label}已在进行中，请稍候。"
+        launcher = BASE_DIR / "native" / "launcher.py"
+        if not launcher.is_file():
+            return False, f"找不到启动器：{launcher}"
+        log_path = BASE_DIR / "dashboard" / f"{action}.log"
+        log_handle = log_path.open("a", encoding="utf-8")
+        env = os.environ.copy()
+        env["OKX_TRADER_ROOT"] = str(BASE_DIR)
+        env["OKX_TRADER_NO_BROWSER"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        kwargs: dict = {
+            "cwd": BASE_DIR,
+            "stdout": log_handle,
+            "stderr": subprocess.STDOUT,
+            "stdin": subprocess.DEVNULL,
+            "env": env,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            _control_process = subprocess.Popen([sys.executable, str(launcher), action], **kwargs)
+            _control_action = action
+        except OSError as exc:
+            return False, f"无法启动{label}进程：{exc}"
+        finally:
+            log_handle.close()
+        _log(f"{action} requested; pid={_control_process.pid}")
+        if action == "stop":
+            return True, "停止命令已发送。策略停止后 Dashboard 将自动关闭。"
+        return True, "重新启动已开始，通常需要 1–2 分钟。"
+
+
+def restart_strategy() -> tuple[bool, str]:
+    return _launch_control("start")
+
+
+def stop_strategy() -> tuple[bool, str]:
+    return _launch_control("stop")
 
 
 def read_status() -> dict:
@@ -949,6 +1004,12 @@ def render_html(status: dict, page: str = "dashboard") -> str:
       letter-spacing: 0.08em;
     }}
     .nav a:hover, .nav a.active {{ color: var(--accent); border-color: var(--accent); }}
+    .nav .restart {{ color: var(--warn); border-color: var(--warn); padding: 2px 12px; }}
+    .nav .restart:hover {{ color: #000; background: var(--warn); }}
+    .nav .restart:disabled {{ color: var(--muted); border-color: var(--muted); cursor: wait; }}
+    .nav .stop {{ color: var(--neg); border-color: var(--neg); padding: 2px 12px; }}
+    .nav .stop:hover {{ color: #000; background: var(--neg); }}
+    .nav .stop:disabled {{ color: var(--muted); border-color: var(--muted); cursor: wait; }}
     .hint {{ color: var(--muted); font-size: 15px; margin: 0 0 10px; }}
     .hint.ok {{ color: var(--pos); }}
     .hint.warn {{ color: var(--warn); }}
@@ -1154,6 +1215,57 @@ def render_html(status: dict, page: str = "dashboard") -> str:
           .then(apply)
           .catch(function() {{}});
       }}
+      window.restartStrategy = function() {{
+        if (!window.confirm('将重新启动实盘交易策略。现有仓位和交易所保护订单不会被主动撤销，确定继续吗？')) return;
+        var btn = $('restart-btn');
+        if (btn) {{ btn.disabled = true; btn.textContent = 'RESTARTING...'; }}
+        fetch('/api/restart', {{
+          method: 'POST',
+          headers: {{'X-Requested-With': 'OKX-Dashboard'}}
+        }})
+          .then(function(r) {{ return r.json().then(function(data) {{ return {{ok: r.ok, data: data}}; }}); }})
+          .then(function(result) {{
+            window.alert(result.data.message || (result.ok ? '重新启动已开始。' : '重新启动失败。'));
+            if (result.ok && btn) {{
+              btn.textContent = 'RESTART STARTED';
+              window.setTimeout(function() {{
+                btn.disabled = false;
+                btn.textContent = 'RESTART BOT';
+              }}, 130000);
+            }} else if (btn) {{
+              btn.disabled = false;
+              btn.textContent = 'RESTART BOT';
+            }}
+          }})
+          .catch(function() {{
+            window.alert('无法发送重新启动请求。');
+            if (btn) {{ btn.disabled = false; btn.textContent = 'RESTART BOT'; }}
+          }});
+      }};
+      window.stopStrategy = function() {{
+        if (!window.confirm('将停止实盘交易策略并关闭 Dashboard，确定继续吗？')) return;
+        var stopBtn = $('stop-btn');
+        var restartBtn = $('restart-btn');
+        if (stopBtn) {{ stopBtn.disabled = true; stopBtn.textContent = 'STOPPING...'; }}
+        if (restartBtn) restartBtn.disabled = true;
+        fetch('/api/stop', {{
+          method: 'POST',
+          headers: {{'X-Requested-With': 'OKX-Dashboard'}}
+        }})
+          .then(function(r) {{ return r.json().then(function(data) {{ return {{ok: r.ok, data: data}}; }}); }})
+          .then(function(result) {{
+            window.alert(result.data.message || (result.ok ? '停止命令已发送。' : '停止失败。'));
+            if (!result.ok) {{
+              if (stopBtn) {{ stopBtn.disabled = false; stopBtn.textContent = 'STOP BOT'; }}
+              if (restartBtn) restartBtn.disabled = false;
+            }}
+          }})
+          .catch(function() {{
+            window.alert('无法发送停止请求。');
+            if (stopBtn) {{ stopBtn.disabled = false; stopBtn.textContent = 'STOP BOT'; }}
+            if (restartBtn) restartBtn.disabled = false;
+          }});
+      }};
       window.addEventListener('load', function() {{
         ['status-badge', 'snapshot-badge', 'stale-banner', 'markets-body', 'perf-body',
          'pos-body', 'ord-body', 'exec-body', 'logbox'].forEach(function(id) {{
@@ -1174,6 +1286,8 @@ def render_html(status: dict, page: str = "dashboard") -> str:
     <h1><a href="/">&gt; OKX_QUANT // {heading}<span class="cursor">_</span></a></h1>
     <nav class="nav">
       {nav_html}
+      <button type="button" id="restart-btn" class="restart" onclick="restartStrategy()">RESTART BOT</button>
+      <button type="button" id="stop-btn" class="stop" onclick="stopStrategy()">STOP BOT</button>
     </nav>
     <div class="refresh-info">LIVE PATCH &nbsp;|&nbsp; <span id="clock">{now_str}</span></div>
   </header>
@@ -1242,6 +1356,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if path in ("/api/restart", "/api/stop"):
+                if self.client_address[0] not in ("127.0.0.1", "::1"):
+                    self._send_json(403, {"ok": False, "message": "只允许从本机控制策略。"})
+                    return
+                if self.headers.get("X-Requested-With") != "OKX-Dashboard":
+                    self._send_json(403, {"ok": False, "message": "请求校验失败。"})
+                    return
+                control = restart_strategy if path == "/api/restart" else stop_strategy
+                started, message = control()
+                self._send_json(202 if started else 409, {"ok": started, "message": message})
+                return
             if path != "/api/config":
                 self.send_response(404)
                 self.end_headers()
