@@ -1,6 +1,9 @@
 from pathlib import Path
 
-from native.launcher import _is_protected, sync_payload
+import pytest
+
+import native.launcher as launcher
+from native.launcher import LauncherError, _is_protected, sync_payload
 
 
 def test_runtime_and_credentials_are_protected():
@@ -30,3 +33,20 @@ def test_sync_payload_updates_code_and_preserves_user_data(tmp_path):
     assert (destination / "dashboard" / "dashboard.py").read_text() == "new code\n"
     assert (destination / "conf" / "controllers" / "bot.yml").read_text() == "user config\n"
     assert (destination / ".native-version").read_text() == "1.1.0\n"
+
+
+def test_start_bot_opens_dashboard_before_waiting_for_docker(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(launcher, "prepare", lambda: tmp_path)
+    monkeypatch.setattr(launcher, "start_dashboard", lambda root: calls.append(("dashboard", root)))
+
+    def unavailable_docker():
+        calls.append(("docker", None))
+        raise LauncherError("Docker unavailable")
+
+    monkeypatch.setattr(launcher, "ensure_docker", unavailable_docker)
+
+    with pytest.raises(LauncherError, match="Docker unavailable"):
+        launcher.start_bot()
+
+    assert calls == [("dashboard", tmp_path), ("docker", None)]

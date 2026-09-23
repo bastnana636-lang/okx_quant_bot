@@ -8,5 +8,5 @@ controllers_config:
   - conf_okx_pmm_sui.yml
   - conf_okx_pmm_sndk.yml
   - conf_okx_pmm_zec.yml
-  - conf_okx_pmm_uni.yml
+  - conf_okx_pmm_okb.yml
   - conf_okx_pmm_ada.yml

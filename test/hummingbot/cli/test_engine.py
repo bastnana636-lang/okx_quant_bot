@@ -188,6 +188,25 @@ class ServeTest(unittest.IsolatedAsyncioTestCase):
             await task
         self.assertFalse(snap.await_args_list[-1].kwargs["running"])
 
+    async def test_snapshot_error_does_not_stop_periodic_updates(self):
+        real_loop = asyncio.get_running_loop()
+        fake_loop, handlers = self._fake_loop(real_loop)
+        hb = _make_hb()
+        hb.stop_loop = AsyncMock()
+        hb.trading_core.shutdown = AsyncMock()
+        snap = AsyncMock(side_effect=[None, OSError(22, "Invalid argument"), None, None])
+        with patch.object(engine, "SNAPSHOT_INTERVAL_S", 0.05), \
+                patch.object(engine, "_write_snapshot", new=snap), \
+                patch.object(bot, "clear_pid"), \
+                patch.object(engine.asyncio, "get_event_loop", return_value=fake_loop):
+            task = real_loop.create_task(engine._serve(hb, "mybot"))
+            deadline = real_loop.time() + 1.0
+            while snap.await_count < 3 and real_loop.time() < deadline:
+                await asyncio.sleep(0.02)
+            self.assertGreaterEqual(snap.await_count, 3)
+            handlers[signal.SIGTERM]()
+            await task
+
 
 class RunEngineTest(unittest.IsolatedAsyncioTestCase):
     def _patches(self, hb, started=True):

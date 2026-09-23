@@ -97,7 +97,12 @@ async def _serve(hb: HummingbotApplication, name: str) -> None:
                 await asyncio.wait_for(stop_event.wait(), timeout=SNAPSHOT_INTERVAL_S)
                 return
             except asyncio.TimeoutError:
-                await _safe_write(running=True)
+                try:
+                    await _safe_write(running=True)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logging.getLogger().exception("Status snapshot failed; retrying on the next interval.")
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop_event.set)

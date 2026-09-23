@@ -1,9 +1,9 @@
 # Pure mean reversion. total_amount_quote is the maximum position notional in USDT.
-id: okx_pmm_uni
+id: okx_pmm_okb
 controller_name: pmm_simple
 controller_type: market_making
 connector_name: okx_perpetual
-trading_pair: UNI-USDT
+trading_pair: OKB-USDT
 total_amount_quote: 200
 leverage: 5
 position_mode: ONEWAY

@@ -251,7 +251,7 @@ def test_unready_shared_candle_feed_shows_warmup_progress(controller):
 
 def test_every_local_config_loads_and_only_uses_new_parameters(policy):
     paths = list((ROOT / 'strategy_configs/okx_mean_reversion').glob('conf_okx_pmm*.yml'))
-    assert len(paths) == 16
+    assert len(paths) == 17
     for path in paths:
         config = policy.PMMSimpleConfig(**yaml.safe_load(path.read_text()))
         assert config.take_profit_quote > 0
@@ -270,7 +270,7 @@ def test_active_configs_use_scaled_notional_and_cash_take_profit(policy):
         'conf_okx_pmm_sui.yml': D('78.75'),
         'conf_okx_pmm_sndk.yml': D('78.75'),
         'conf_okx_pmm_zec.yml': D('78.75'),
-        'conf_okx_pmm_uni.yml': D('78.75'),
+        'conf_okx_pmm_okb.yml': D('78.75'),
         'conf_okx_pmm_ada.yml': D('78.75'),
     }
     assert set(script['controllers_config']) == set(expected)

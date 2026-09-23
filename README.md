@@ -82,7 +82,7 @@ quant_okx_trader/
 | **SUI-USDT** | 78.75 | 3x | 2.0 ~ 3.5 | 0.4 | 0.75 USDT | 1.5x |
 | **SNDK-USDT** | 78.75 | 3x | 2.0 ~ 3.5 | 0.4 | 0.75 USDT | 1.5x |
 | **ZEC-USDT** | 78.75 | 3x | 2.0 ~ 3.5 | 0.4 | 0.75 USDT | 1.5x |
-| **UNI-USDT** | 78.75 | 3x | 2.0 ~ 3.5 | 0.4 | 0.75 USDT | 1.5x |
+| **OKB-USDT** | 78.75 | 3x | 2.0 ~ 3.5 | 0.4 | 0.75 USDT | 1.5x |
 | **ADA-USDT** | 78.75 | 3x | 2.0 ~ 3.5 | 0.4 | 0.75 USDT | 1.5x |
 
 > 参数模板统一归档于 `strategy_configs/okx_mean_reversion/`。实盘参数以 `conf/controllers/` 为准，可在监控面板的 **CONFIG** 页修改；保存后需要重启策略才会生效。
