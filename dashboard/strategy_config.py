@@ -19,6 +19,16 @@ CONTROLLERS_DIR = ROOT / "conf" / "controllers"
 FILE_NAME_RE = re.compile(r"^conf_okx_pmm_[a-z0-9]+\.yml$")
 KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(.*?)\s*$")
 INTERVALS = ("1m", "3m", "5m", "15m", "30m", "1h")
+STRATEGY_INFO = {
+    "key": "standard_5m",
+    "name": "标准均值回归 (5m)",
+    "badge": "5m 均值回归策略",
+    "interval": "5m",
+    "mean_window": 48,
+    "time_limit": 3600,
+    "description": "5分钟 K 线，4小时均值窗口，持仓时限 1 小时，动态 ATR 止损 0.6%~2%，稳健波段均值修复。",
+}
+
 
 # (key, label, kind, bounds)
 # kind: int | decimal | choice | bool
@@ -27,6 +37,7 @@ PAIR_FIELDS = (
     ("leverage", "杠杆", "int", (1, 5)),
     ("total_amount_quote", "开单金额 USDT", "decimal", {"gt": 0}),
     ("take_profit_quote", "止盈 USDT", "decimal", {"gt": 0}),
+    ("fixed_unrealized_tp_quote", "固定浮盈平仓 USDT", "decimal", {"gt": 1}),
 )
 SHARED_FIELDS = (
     ("candles_interval", "K 线周期", "choice", INTERVALS),
@@ -112,9 +123,11 @@ def load_config(script_file: Path = SCRIPT_FILE, controllers_dir: Path = CONTROL
         if not path.is_file():
             raise ConfigError(f"找不到控制器配置 {name}")
         raw = parse_flat_yaml(path.read_text(encoding="utf-8"))
-        missing = [key for key in EDITABLE_KEYS | {"trading_pair"} if key not in raw]
+        required = (EDITABLE_KEYS - {"fixed_unrealized_tp_quote"}) | {"trading_pair"}
+        missing = [key for key in required if key not in raw]
         if missing:
             raise ConfigError(f"{name} 缺少字段: {', '.join(missing)}")
+        raw.setdefault("fixed_unrealized_tp_quote", "2")
         parsed.append((name, raw))
 
     shared = {key: parsed[0][1][key] for key in SHARED_KEYS}
@@ -132,13 +145,16 @@ def load_config(script_file: Path = SCRIPT_FILE, controllers_dir: Path = CONTROL
             "leverage": raw["leverage"],
             "total_amount_quote": raw["total_amount_quote"],
             "take_profit_quote": raw["take_profit_quote"],
+            "fixed_unrealized_tp_quote": raw.get("fixed_unrealized_tp_quote", "2"),
         })
     return {
         "pairs": pairs,
         "shared": shared,
         "shared_mixed": mixed,
         "defaults": {"leverage": 3},
+        "strategy": STRATEGY_INFO,
     }
+
 
 
 def apply_config(payload: dict, script_file: Path = SCRIPT_FILE,
@@ -205,7 +221,10 @@ def _normalize_fields(source: dict, specs) -> dict[str, str]:
     values = {}
     for key, label, kind, bounds in specs:
         if key not in source:
-            raise ConfigError(f"缺少 {label}")
+            if key == "fixed_unrealized_tp_quote":
+                source[key] = "2"
+            else:
+                raise ConfigError(f"缺少 {label}")
         values[key] = _normalize_value(label, source[key], kind, bounds)
     return values
 
@@ -275,3 +294,18 @@ def _atomic_write(path: Path, text: str) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(text, encoding="utf-8")
     temporary.replace(path)
+
+
+def get_strategy_info(controllers_dir: Path = CONTROLLERS_DIR) -> dict:
+    """Return active strategy metadata."""
+    return STRATEGY_INFO
+
+
+def get_presets_info(controllers_dir: Path = CONTROLLERS_DIR) -> dict:
+    """Compatibility wrapper returning current active strategy info."""
+    return {
+        "active_preset": "standard_5m",
+        "active_meta": STRATEGY_INFO,
+        "presets": [STRATEGY_INFO],
+    }
+

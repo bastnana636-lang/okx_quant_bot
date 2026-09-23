@@ -469,11 +469,11 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
-        # Check the absolute net floating profit on every executor tick, including partial fills.
-        # Submit a market close immediately, without waiting for the controller's next report.
+        # Close on gross price PnL, including partial fills. Fees are not part of the trigger.
+        # After the close fills, realized PnL stays net_pnl_quote = trade_pnl_quote - cum_fees_quote.
         quote_target = self.config.triple_barrier_config.take_profit_quote
         if (quote_target is not None and self.open_filled_amount > 0
-                and self.net_pnl_quote >= quote_target):
+                and self.trade_pnl_quote >= quote_target):
             self.place_close_order_and_cancel_open_orders(close_type=CloseType.TAKE_PROFIT)
             return
         if self._open_order and self._open_order.is_filled and self.open_filled_amount >= self.trading_rules.min_order_size \

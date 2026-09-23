@@ -112,6 +112,8 @@ coverage.xml
 .claude/
 .cursor/
 .agents/
+.skills/
+.hallmark/
 
 
 # GRVT

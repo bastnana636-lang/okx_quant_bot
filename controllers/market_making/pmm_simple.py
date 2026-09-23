@@ -1,7 +1,7 @@
 """Single-position mean reversion, retaining the existing pmm_simple entry point."""
 
 from decimal import Decimal
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import Field, field_validator
 
@@ -25,6 +25,17 @@ class PMMSimpleConfig(ControllerConfigBase, MeanReversionSettings):
     leverage: int = Field(default=3, ge=1, le=5)
     position_mode: PositionMode = PositionMode.ONEWAY
     take_profit_quote: Decimal = Field(default=Decimal("0.3"), gt=0)
+    fixed_unrealized_tp_quote: Optional[Decimal] = Field(default=None, gt=1)
+
+    @field_validator("fixed_unrealized_tp_quote", mode="before")
+    @classmethod
+    def validate_fixed_unrealized_tp(cls, value):
+        if value is None or value == "" or value == "null" or value == "None":
+            return None
+        val = Decimal(str(value))
+        if val <= 1:
+            raise ValueError("fixed_unrealized_tp_quote must be greater than 1")
+        return val
 
     @field_validator("position_mode", mode="before")
     @classmethod
@@ -52,6 +63,21 @@ class PMMSimpleController(ControllerBase):
         )]
 
     async def control_task(self):
+        # A dashboard close is handled even when the candle feed is down.
+        close_actions = self.manual_close_actions()
+        if close_actions is not None:
+            if close_actions:
+                await self.send_actions(close_actions)
+            return
+
+        # Fixed unrealized take-profit check:
+        # Closes immediately when UNREALIZED (USDT) in PERFORMANCE MATRIX > fixed_unrealized_tp_quote (> 1)
+        fixed_tp_actions = self.fixed_unrealized_tp_actions()
+        if fixed_tp_actions is not None:
+            if fixed_tp_actions:
+                await self.send_actions(fixed_tp_actions)
+            return
+
         # Cancel stale entry orders even when the candle feed is unavailable.
         # Filled positions have independent executor-level profit/loss checks.
         if self.executors_update_event.is_set():
@@ -59,6 +85,150 @@ class PMMSimpleController(ControllerBase):
             actions = self.determine_executor_actions()
             if actions:
                 await self.send_actions(actions)
+
+    def _close_request_path(self):
+        import os
+        import re
+        from pathlib import Path
+
+        controller_id = str(self.config.id)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", controller_id):
+            return None
+        root = Path(os.environ.get("OKX_TRADER_ROOT") or Path.cwd())
+        return root / "data" / "dashboard" / "close_requests" / controller_id
+
+    def manual_close_actions(self):
+        """Consume one dashboard close request and flatten this controller."""
+        path = self._close_request_path()
+        if path is None or not path.is_file():
+            return None
+        try:
+            path.unlink()
+        except OSError:
+            return None
+        self.processed_data["reason"] = "manual_close"
+        now = self.market_data_provider.time()
+        self._cooldown_until = max(self._cooldown_until, now + float(self.config.cooldown_time))
+        actions = []
+        owns_position = False
+        for executor in self.executors_info:
+            if not executor.is_done:
+                owns_position = True
+            if executor.is_active:
+                actions.append(StopExecutorAction(
+                    controller_id=self.config.id,
+                    executor_id=executor.id,
+                    keep_position=False,
+                ))
+        # An active executor market-closes its own fill. A second order would reverse it.
+        if not owns_position:
+            self._market_close_exchange_position()
+        return actions
+
+    def get_current_unrealized_pnl(self) -> Decimal:
+        """Get current unrealized PnL matching the UNREALIZED (USDT) column in PERFORMANCE MATRIX."""
+        if hasattr(self, "performance_report") and self.performance_report:
+            val = getattr(self.performance_report, "unrealized_pnl_quote", None)
+            if val is not None:
+                return Decimal(str(val))
+        total = Decimal("0")
+        for ex in getattr(self, "executors_info", []):
+            if not ex.is_done and hasattr(ex, "net_pnl_quote"):
+                total += Decimal(str(ex.net_pnl_quote))
+        for pos in getattr(self, "positions_held", []):
+            if hasattr(pos, "unrealized_pnl_quote"):
+                total += Decimal(str(pos.unrealized_pnl_quote))
+        if total == Decimal("0") and hasattr(self, "market_data_provider"):
+            try:
+                connector = self.market_data_provider.get_connector(self.config.connector_name)
+                for pos in getattr(connector, "account_positions", {}).values():
+                    if pos.trading_pair == self.config.trading_pair and getattr(pos, "unrealized_pnl", None) is not None:
+                        total += Decimal(str(pos.unrealized_pnl))
+            except Exception:
+                pass
+        return total
+
+    def fixed_unrealized_tp_actions(self):
+        """If UNREALIZED (USDT) in PERFORMANCE MATRIX > fixed_unrealized_tp_quote (> 1),
+        close position immediately without needing any other conditions."""
+        target = getattr(self.config, "fixed_unrealized_tp_quote", None)
+        if target is None:
+            return None
+        try:
+            target = Decimal(str(target))
+        except (ValueError, TypeError, ArithmeticError):
+            return None
+        if target <= 1:
+            return None
+
+        current_unrealized = self.get_current_unrealized_pnl()
+        if current_unrealized <= target:
+            return None
+
+        has_active_executor = any(
+            ex.is_active and (ex.is_trading or ex.filled_amount_quote > 0)
+            for ex in getattr(self, "executors_info", [])
+        )
+        has_position = any(p.amount != 0 for p in getattr(self, "positions_held", []))
+        connector = self.market_data_provider.get_connector(self.config.connector_name)
+        has_exchange_pos = any(
+            pos.trading_pair == self.config.trading_pair and pos.amount != 0
+            for pos in getattr(connector, "account_positions", {}).values()
+        )
+        if not (has_active_executor or has_position or has_exchange_pos):
+            return None
+
+        self.logger().info(
+            f"[{self.config.trading_pair}] Fixed unrealized TP triggered: "
+            f"unrealized {current_unrealized:.4f} > target {target:.4f} USDT. "
+            f"Immediately closing position."
+        )
+        self.processed_data["reason"] = f"fixed_unrealized_tp({current_unrealized:.2f}>{target:.2f})"
+        now = self.market_data_provider.time()
+        self._cooldown_until = max(self._cooldown_until, now + float(self.config.cooldown_time))
+        actions = []
+        owns_position = False
+        for executor in self.executors_info:
+            if not executor.is_done:
+                owns_position = True
+            if executor.is_active:
+                actions.append(StopExecutorAction(
+                    controller_id=self.config.id,
+                    executor_id=executor.id,
+                    keep_position=False,
+                ))
+        if not owns_position:
+            self._market_close_exchange_position()
+        return actions
+
+    def _market_close_exchange_position(self):
+        from decimal import Decimal
+
+        from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType
+
+        connector = self.market_data_provider.get_connector(self.config.connector_name)
+        price = Decimal(str(self.market_data_provider.get_price_by_type(
+            self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)))
+        rules = self.market_data_provider.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        min_notional = max(rules.min_notional_size, getattr(rules, "min_order_value", Decimal("0")))
+        for position in connector.account_positions.values():
+            if position.trading_pair != self.config.trading_pair or position.amount == 0:
+                continue
+            amount = self.market_data_provider.quantize_order_amount(
+                self.config.connector_name, self.config.trading_pair, abs(Decimal(str(position.amount))))
+            if amount <= 0 or amount < rules.min_order_size or amount * price < min_notional:
+                self.processed_data["reason"] = "manual_close_below_minimum"
+                continue
+            order = dict(
+                trading_pair=self.config.trading_pair, amount=amount,
+                order_type=OrderType.MARKET, price=Decimal("NaN"),
+                position_action=PositionAction.OPEN,
+            )
+            if position.amount > 0:
+                connector.sell(**order)
+            else:
+                connector.buy(**order)
+            self.logger().info(f"Manual close {self.config.trading_pair} amount={amount}")
 
     async def update_processed_data(self):
         self._snapshot = None

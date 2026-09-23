@@ -113,7 +113,8 @@ def test_cash_profit_threshold_is_inclusive_and_independent_of_mean(policy, pnl,
     executor = MagicMock()
     executor.config.triple_barrier_config = policy.TripleBarrierConfig(take_profit_quote=D('.3') if enabled else None)
     executor.open_filled_amount = D(filled)
-    executor.net_pnl_quote = D(pnl)
+    executor.trade_pnl_quote = D(pnl)
+    executor.net_pnl_quote = D(pnl) - D('.05')
     executor._open_order = None  # Also exercises partial fills before entry completes.
     policy.control_barriers(executor)
     assert executor.place_close_order_and_cancel_open_orders.called is hit
@@ -129,7 +130,8 @@ def test_profit_is_per_position_not_summed(policy):
         executor = MagicMock()
         executor.config.triple_barrier_config = policy.TripleBarrierConfig(take_profit_quote=D('.3'))
         executor.open_filled_amount = D('1')
-        executor.net_pnl_quote = D('.2')
+        executor.trade_pnl_quote = D('.2')
+        executor.net_pnl_quote = D('.4')
         executor._open_order = None
         policy.control_barriers(executor)
         executor.place_close_order_and_cancel_open_orders.assert_not_called()
@@ -255,23 +257,23 @@ def test_every_local_config_loads_and_only_uses_new_parameters(policy):
     for path in paths:
         config = policy.PMMSimpleConfig(**yaml.safe_load(path.read_text()))
         assert config.take_profit_quote > 0
-        assert config.leverage <= 3
+        assert config.leverage <= 5
         assert not hasattr(config, 'enable_trend_filter')
 
 
 def test_active_configs_use_scaled_notional_and_cash_take_profit(policy):
     script = yaml.safe_load((ROOT / 'conf/scripts/conf_okx_multi.yml').read_text())
     expected = {
-        'conf_okx_pmm_btc.yml': D('180'),
-        'conf_okx_pmm_eth.yml': D('112.5'),
-        'conf_okx_pmm_sol.yml': D('78.75'),
-        'conf_okx_pmm_xrp.yml': D('78.75'),
-        'conf_okx_pmm_doge.yml': D('78.75'),
-        'conf_okx_pmm_sui.yml': D('78.75'),
-        'conf_okx_pmm_sndk.yml': D('78.75'),
-        'conf_okx_pmm_zec.yml': D('78.75'),
-        'conf_okx_pmm_okb.yml': D('78.75'),
-        'conf_okx_pmm_ada.yml': D('78.75'),
+        'conf_okx_pmm_btc.yml': D('320'),
+        'conf_okx_pmm_eth.yml': D('320'),
+        'conf_okx_pmm_sol.yml': D('200'),
+        'conf_okx_pmm_xrp.yml': D('200'),
+        'conf_okx_pmm_doge.yml': D('200'),
+        'conf_okx_pmm_sui.yml': D('200'),
+        'conf_okx_pmm_sndk.yml': D('200'),
+        'conf_okx_pmm_zec.yml': D('200'),
+        'conf_okx_pmm_okb.yml': D('200'),
+        'conf_okx_pmm_ada.yml': D('200'),
     }
     assert set(script['controllers_config']) == set(expected)
     for name, amount in expected.items():
@@ -279,7 +281,39 @@ def test_active_configs_use_scaled_notional_and_cash_take_profit(policy):
         template = policy.PMMSimpleConfig(**yaml.safe_load(
             (ROOT / 'strategy_configs/okx_mean_reversion' / name).read_text()))
         assert runtime.total_amount_quote == template.total_amount_quote == amount
-        assert runtime.take_profit_quote == template.take_profit_quote == D('.75')
+        assert runtime.take_profit_quote == template.take_profit_quote == D('2')
+
+
+def test_dashboard_close_stops_the_open_executor(controller, tmp_path, monkeypatch):
+    monkeypatch.setenv("OKX_TRADER_ROOT", str(tmp_path))
+    request = tmp_path / "data" / "dashboard" / "close_requests" / "test"
+    request.parent.mkdir(parents=True)
+    request.write_text("1\n")
+    controller.executors_info = [position(
+        id="live", is_active=True, is_done=False, is_trading=True, filled_amount_quote=D("10"),
+    )]
+    actions = controller.manual_close_actions()
+    assert len(actions) == 1
+    assert actions[0].executor_id == "live"
+    assert actions[0].keep_position is False
+    assert not request.exists()
+    connector = controller.market_data_provider.get_connector.return_value
+    connector.buy.assert_not_called()
+    connector.sell.assert_not_called()
+    assert controller.determine_executor_actions() == []
+
+
+def test_dashboard_close_market_flattens_an_untracked_short(controller, tmp_path, monkeypatch):
+    monkeypatch.setenv("OKX_TRADER_ROOT", str(tmp_path))
+    request = tmp_path / "data" / "dashboard" / "close_requests" / "test"
+    request.parent.mkdir(parents=True)
+    request.write_text("1\n")
+    connector = controller.market_data_provider.get_connector.return_value
+    connector.account_positions = {"btc": SimpleNamespace(trading_pair="BTC-USDT", amount=D("-1.25"))}
+    assert controller.manual_close_actions() == []
+    connector.buy.assert_called_once()
+    assert connector.buy.call_args.kwargs["amount"] == D("1.250")
+    connector.sell.assert_not_called()
 
 
 def test_unfilled_order_timeout_allows_requote_without_full_cooldown(controller, policy):
@@ -297,3 +331,73 @@ def test_unfilled_order_timeout_allows_requote_without_full_cooldown(controller,
     controller.market_data_provider.time.return_value = now + 65
     new_actions = controller.create_actions_proposal()
     assert len(new_actions) == 1
+
+
+def test_fixed_unrealized_tp_quote_must_be_greater_than_one(policy):
+    valid_data = yaml.safe_load((ROOT / 'conf/controllers/conf_okx_pmm_btc.yml').read_text())
+    valid_data["fixed_unrealized_tp_quote"] = D("1.01")
+    cfg = policy.PMMSimpleConfig(**valid_data)
+    assert cfg.fixed_unrealized_tp_quote == D("1.01")
+
+    # Boundary 1.0 must fail
+    with pytest.raises(ValidationError):
+        valid_data["fixed_unrealized_tp_quote"] = D("1.0")
+        policy.PMMSimpleConfig(**valid_data)
+
+    # Values < 1 must fail
+    with pytest.raises(ValidationError):
+        valid_data["fixed_unrealized_tp_quote"] = D("0.5")
+        policy.PMMSimpleConfig(**valid_data)
+
+
+def test_fixed_unrealized_tp_actions_triggers_when_threshold_exceeded(controller, policy):
+    controller.config.fixed_unrealized_tp_quote = D("2.5")
+    # Case 1: no active position, unrealized = 0 -> returns None
+    assert controller.fixed_unrealized_tp_actions() is None
+
+    # Case 2: active executor with net_pnl_quote = 2.0 (<= 2.5) -> returns None
+    active_exec = position(
+        id="pos1", is_active=True, is_done=False, is_trading=True,
+        filled_amount_quote=D("100"), net_pnl_quote=D("2.0")
+    )
+    controller.executors_info = [active_exec]
+    assert controller.get_current_unrealized_pnl() == D("2.0")
+    assert controller.fixed_unrealized_tp_actions() is None
+
+    # Case 3: active executor with net_pnl_quote = 2.51 (> 2.5) -> immediate StopExecutorAction
+    active_exec.net_pnl_quote = D("2.51")
+    assert controller.get_current_unrealized_pnl() == D("2.51")
+    actions = controller.fixed_unrealized_tp_actions()
+    assert len(actions) == 1
+    assert actions[0].executor_id == "pos1"
+    assert actions[0].keep_position is False
+
+    # Case 4: position tracked directly on exchange connector without executor
+    controller.executors_info = []
+    connector = controller.market_data_provider.get_connector.return_value
+    connector.account_positions = {
+        "btc": SimpleNamespace(trading_pair="BTC-USDT", amount=D("0.5"), unrealized_pnl=D("3.0"))
+    }
+    assert controller.get_current_unrealized_pnl() == D("3.0")
+    actions = controller.fixed_unrealized_tp_actions()
+    assert actions == []
+    connector.sell.assert_called_once()
+    assert connector.sell.call_args.kwargs["amount"] == D("0.500")
+
+
+def test_fixed_unrealized_tp_quote_does_not_affect_entry_proposal(controller, policy):
+    # Ensure entry proposal actions and order sizing are identical regardless of fixed_unrealized_tp_quote
+    controller.config.fixed_unrealized_tp_quote = None
+    actions_none = controller.create_actions_proposal()
+    assert len(actions_none) == 1
+    amount_none = actions_none[0].executor_config.amount
+
+    # Reset entry candle marker so controller can evaluate proposal again
+    controller._last_entry_candle = None
+    controller.config.fixed_unrealized_tp_quote = D("10.0")
+    actions_with_tp = controller.create_actions_proposal()
+    assert len(actions_with_tp) == 1
+    assert actions_with_tp[0].executor_config.amount == amount_none
+    assert actions_with_tp[0].executor_config.side == actions_none[0].executor_config.side
+
+

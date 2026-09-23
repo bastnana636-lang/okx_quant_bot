@@ -32,7 +32,7 @@ from hummingbot.client.runner import (
 
 BALANCE_TIMEOUT = 10.0
 # Fresh status.json for dashboards / `hbot status` without requiring a SIGUSR1 each time.
-SNAPSHOT_INTERVAL_S = 5.0
+SNAPSHOT_INTERVAL_S = 2.0
 
 
 async def _collect_balances(hb: HummingbotApplication) -> Dict[str, Dict[str, float]]:

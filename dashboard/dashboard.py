@@ -25,9 +25,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 try:
-    from strategy_config import SHARED_FIELDS, ConfigError, apply_config, load_config
+    from strategy_config import (
+        SHARED_FIELDS, ConfigError, apply_config,
+        get_presets_info, get_strategy_info, load_config, STRATEGY_INFO,
+    )
 except ImportError:  # imported as dashboard.dashboard
-    from dashboard.strategy_config import SHARED_FIELDS, ConfigError, apply_config, load_config
+    from dashboard.strategy_config import (
+        SHARED_FIELDS, ConfigError, apply_config,
+        get_presets_info, get_strategy_info, load_config, STRATEGY_INFO,
+    )
+
 
 # ─── 路径配置 ────────────────────────────────────────────────────────────────
 BASE_DIR = Path(os.environ.get("OKX_TRADER_ROOT", Path(__file__).parent.parent)).resolve()
@@ -92,6 +99,7 @@ def _launch_control(action: str) -> tuple[bool, str]:
 
 
 def restart_strategy() -> tuple[bool, str]:
+    reset_session_baseline()
     return _launch_control("start")
 
 
@@ -138,7 +146,6 @@ COIN_ICONS: dict[str, str] = {
     "XRP": "https://cdn.simpleicons.org/xrp/00e5ff",
     "DOGE": "https://cdn.simpleicons.org/dogecoin/00e5ff",
     "SUI": "https://cdn.simpleicons.org/sui/00e5ff",
-    "SNDK": "https://commons.wikimedia.org/wiki/Special:Redirect/file/SanDisk%202024%20logo.svg",
     "ZEC": "https://cdn.simpleicons.org/zcash/00e5ff",
     "UNI": "https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/svg/white/uni.svg",
     "OKB": "https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/svg/white/okb.svg",
@@ -154,7 +161,8 @@ def _coin_icon(symbol: str) -> str:
     image = ""
     if src:
         image = (
-            f'<img src="{html.escape(src, quote=True)}" alt="" '
+            f'<img src="{html.escape(src, quote=True)}" alt="" width="14" height="14" '
+            'style="width:14px;height:14px;max-width:14px;max-height:14px;object-fit:contain;display:block;" '
             'loading="eager" decoding="async" referrerpolicy="no-referrer" '
             'onload="this.previousElementSibling.hidden=true" '
             'onerror="this.hidden=true;this.previousElementSibling.hidden=false">'
@@ -313,7 +321,7 @@ def build_markets(pairs: list[str]) -> tuple[str, str]:
         if last is None:
             rows.append(
                 f"<tr><td>{pair_label(pair)}</td>"
-                + '<td colspan="8" class="empty">-- NO QUOTE --</td></tr>'
+                + '<td colspan="8" class="empty">暂无公开行情报价</td></tr>'
             )
             continue
         chg = ((last - open24) / open24) if open24 else None
@@ -339,7 +347,7 @@ def build_markets(pairs: list[str]) -> tuple[str, str]:
             "</tr>"
         )
     if not rows:
-        rows.append('<tr><td colspan="9" class="empty">-- NO MARKETS --</td></tr>')
+        rows.append('<tr><td colspan="9" class="empty">暂无监控交易对行情</td></tr>')
     return "".join(rows), meta
 
 
@@ -459,6 +467,40 @@ def save_manual_closes(closes: list[dict]) -> None:
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def known_controllers() -> set[str]:
+    names = set()
+    status = read_status()
+    if not status.get("error"):
+        names.update(
+            row["controller"] for row in parse_performance_table(status)
+            if row["controller"] != "GLOBAL TOTAL"
+        )
+    conf_dir = BASE_DIR / "conf" / "controllers"
+    if conf_dir.is_dir():
+        for path in conf_dir.glob("*.yml"):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            match = re.search(r"(?m)^id:\s*([A-Za-z0-9_]+)\s*$", text)
+            if match:
+                names.add(match.group(1))
+    return names
+
+
+def request_position_close(controller: str) -> str:
+    """Ask the running strategy to market-close this controller on its next tick."""
+    controller = controller.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]+", controller):
+        raise ValueError("控制器无效")
+    if controller not in known_controllers():
+        raise ValueError("没有这个控制器")
+    request_dir = BASE_DIR / "data" / "dashboard" / "close_requests"
+    request_dir.mkdir(parents=True, exist_ok=True)
+    (request_dir / controller).write_text(f"{time.time()}\n", encoding="utf-8")
+    return f"{controller} 平仓请求已发送。策略运行时会在下一轮市价平仓，并撤销未成交开仓单。"
 
 
 def mark_manual_close(pair: str, side: str, amount: float, breakeven: float, pnl: float) -> list[dict]:
@@ -637,6 +679,88 @@ def fmt_snapshot_age(age: float | None) -> str:
     return f"{age / 60:.1f}m ago"
 
 
+_session_lock = threading.Lock()
+_session_data = {
+    "session_key": None,
+    "baseline_assets": None,
+    "baseline_realized_by_ctrl": {},
+    "history": [],  # list of {"t": int, "bot_pnl": float, "assets": float}
+}
+
+
+def reset_session_baseline() -> None:
+    """策略重新启动时调用，强制归零本机挂单操作盈亏与已实现/未实现盈亏。"""
+    with _session_lock:
+        _session_data["session_key"] = None
+        _session_data["baseline_assets"] = None
+        _session_data["baseline_realized_by_ctrl"] = {}
+        _session_data["history"] = []
+
+
+def _sync_session_metrics(engine: dict, updated_at: float, perf_rows: list[dict], usdt_bal: float) -> tuple[float, float, float, str, list[dict]]:
+    """
+    每次重启清零重算 REALIZED / UNREALIZED；
+    GLOBAL PNL 不使用历史统计，就用 REALIZED 和 UNREALIZED 求和；
+    返回: (global_realized, global_unrealized, global_pnl, glob_pct, session_history)
+    """
+    raw_start = engine.get("start_time") or engine.get("uptime") or 0
+    session_key = str(raw_start)
+
+    with _session_lock:
+        if _session_data["session_key"] != session_key or not _session_data["baseline_realized_by_ctrl"]:
+            _session_data["session_key"] = session_key
+            _session_data["baseline_assets"] = float(usdt_bal)
+            _session_data["baseline_realized_by_ctrl"] = {}
+            for r in perf_rows:
+                _session_data["baseline_realized_by_ctrl"][r["controller"]] = float(r["realized"])
+            _session_data["history"] = [
+                {"t": int(updated_at - 60) if updated_at else int(time.time() - 60), "bot_pnl": 0.0, "assets": round(float(usdt_bal), 2)},
+                {"t": int(updated_at) if updated_at else int(time.time()), "bot_pnl": 0.0, "assets": round(float(usdt_bal), 2)},
+            ]
+        else:
+            for r in perf_rows:
+                if r["controller"] not in _session_data["baseline_realized_by_ctrl"]:
+                    _session_data["baseline_realized_by_ctrl"][r["controller"]] = float(r["realized"])
+
+        base_map = dict(_session_data["baseline_realized_by_ctrl"])
+
+    # 1. 各个 controller 扣除启动基线，重启归零重算
+    ctrl_rows = [r for r in perf_rows if r["controller"] != "GLOBAL TOTAL"]
+    for r in ctrl_rows:
+        ctrl = r["controller"]
+        base_r = base_map.get(ctrl, 0.0)
+        r["realized"] = round(r["realized"] - base_r, 4)
+        r["global"] = round(r["realized"] + r["unrealized"], 4)
+        r["global_pct"] = _pnl_pct(r["global"], r["volume"])
+
+    # 2. GLOBAL TOTAL: REALIZED 和 UNREALIZED 严格求和，不带历史统计
+    global_realized = round(sum(r["realized"] for r in ctrl_rows), 4)
+    global_unrealized = round(sum(r["unrealized"] for r in ctrl_rows), 4)
+    global_pnl = round(global_realized + global_unrealized, 4)
+    total_volume = sum(r["volume"] for r in ctrl_rows)
+    glob_pct = _pnl_pct(global_pnl, total_volume)
+
+    global_row = next((r for r in perf_rows if r["controller"] == "GLOBAL TOTAL"), None)
+    if global_row:
+        global_row["realized"] = global_realized
+        global_row["unrealized"] = global_unrealized
+        global_row["global"] = global_pnl
+        global_row["global_pct"] = glob_pct
+        global_row["volume"] = total_volume
+
+    # 3. 记录历史曲线点（挂单盈亏从0开始，总资产从实际余额开始）
+    with _session_lock:
+        if updated_at > 0:
+            hist = _session_data["history"]
+            if not hist or (updated_at - hist[-1]["t"] >= 2.0) or hist[-1]["bot_pnl"] != global_pnl or hist[-1]["assets"] != round(float(usdt_bal), 2):
+                hist.append({"t": int(updated_at), "bot_pnl": global_pnl, "assets": round(float(usdt_bal), 2)})
+                if len(hist) > 150:
+                    hist.pop(0)
+        session_history = list(_session_data["history"])
+
+    return global_realized, global_unrealized, global_pnl, glob_pct, session_history
+
+
 def build_view(status: dict) -> dict:
     """把 status.json 收成面板可原地补丁的字段（数字 + 表格 HTML）。"""
     err = status.get("error")
@@ -659,11 +783,9 @@ def build_view(status: dict) -> dict:
     updated_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(updated_at)) if updated_at else "-"
 
     usdt_bal = float(balances.get("USDT", 0) or 0)
-    global_row = next((r for r in perf_rows if r["controller"] == "GLOBAL TOTAL"), None)
-    global_pnl = global_row["global"] if global_row else 0
-    glob_pct   = global_row["global_pct"] if global_row else "-"
-    realized   = global_row["realized"] if global_row else 0
-    unrealized = global_row["unrealized"] if global_row else 0
+    realized, unrealized, global_pnl, glob_pct, session_history = _sync_session_metrics(
+        engine, updated_at, perf_rows, usdt_bal
+    )
 
     perf_html = ""
     for r in perf_rows:
@@ -685,9 +807,17 @@ def build_view(status: dict) -> dict:
                 z_cls = "pos" if z_val > 0 else ("neg" if z_val < 0 else "zero")
                 z_cell = f'<td><span class="{z_cls}" title="{reason}">{z_val:+.2f}</span></td>'
 
+        if ctrl == "GLOBAL TOTAL":
+            close_cell = "<td>-</td>"
+        else:
+            close_cell = (
+                f'<td><button type="button" class="close-position" '
+                f'data-controller="{html.escape(ctrl, quote=True)}">平仓</button></td>'
+            )
         perf_html += (
             f'<tr class="{cls}">'
             f'<td>{coin_label(ctrl)}</td>'
+            f"{close_cell}"
             f'{z_cell}'
             f'<td class="{color_val(r["realized"])}">{r["realized"]:+.4f}</td>'
             f'<td class="{color_val(r["unrealized"])}">{r["unrealized"]:+.4f}</td>'
@@ -719,7 +849,7 @@ def build_view(status: dict) -> dict:
             f"</tr>"
         )
     if not pos_html:
-        pos_html = '<tr><td colspan="9" class="empty">-- NO POSITIONS --</td></tr>'
+        pos_html = '<tr><td colspan="9" class="empty">当前暂无活跃持仓，策略持续监控入场机会</td></tr>'
 
     ord_html = ""
     for o in orders:
@@ -734,13 +864,13 @@ def build_view(status: dict) -> dict:
             f"</tr>"
         )
     if not ord_html:
-        ord_html = '<tr><td colspan="5" class="empty">-- NO ORDERS --</td></tr>'
+        ord_html = '<tr><td colspan="5" class="empty">当前暂无待成交挂单</td></tr>'
 
     exec_html = ""
     for e in executors:
         side_cls = "pos" if e["side"] == "BUY" else "neg"
         badge_cls = {"RUNNING": "badge green", "TERMINATED": "badge gray"}.get(e["status"], "badge gray")
-        trading_ind = "[*]" if e["is_trading"] else "[ ]"
+        trading_ind = "●" if e["is_trading"] else "○"
         if e["close_type"] == "TAKE_PROFIT":
             close_lbl = f'<span class="badge green">{e["close_type"]}</span>'
         elif e["close_type"] == "STOP_LOSS":
@@ -761,7 +891,7 @@ def build_view(status: dict) -> dict:
             f"</tr>"
         )
     if not exec_html:
-        exec_html = '<tr><td colspan="9" class="empty">-- NO EXECUTORS --</td></tr>'
+        exec_html = '<tr><td colspan="9" class="empty">当前暂无进行中的执行器</td></tr>'
 
     log_html = "\n".join(
         f'<div class="log-line {"log-warn" if "WARNING" in line or "ERROR" in line else ""}">{line}</div>'
@@ -772,22 +902,28 @@ def build_view(status: dict) -> dict:
         if stale else ""
     )
 
+    bot_session_pnl = global_pnl
+    strategy_info = get_strategy_info()
     return {
         "error": None,
         "updated_at": updated_at,
+        "snapshot_age_s": round(snapshot_age, 1) if snapshot_age is not None else None,
         "uptime_s": uptime_s,
         "running": running,
         "stale": stale,
         "strategy": engine.get("strategy_file_name", "-") or "-",
         "status_html": (
-            '<span class="badge green">ON</span>' if running
-            else '<span class="badge red">OFF</span>'
+            '<span class="badge green"><span class="status-dot"></span>ON</span>' if running
+            else '<span class="badge red"><span class="status-dot"></span>OFF</span>'
         ),
         "snapshot_badge_html": (
             '<span class="badge green">LIVE</span>' if not stale
             else '<span class="badge red">STALE</span>'
         ),
         "usdt_bal": f"{usdt_bal:,.2f}",
+        "bot_session_pnl_html": f"{bot_session_pnl:+.4f}",
+        "bot_session_pnl_cls": color_val(bot_session_pnl),
+        "history": session_history,
         "global_pnl_html": f"{global_pnl:+.4f} ({glob_pct})",
         "global_pnl_cls": color_val(global_pnl),
         "realized_html": f"{realized:+.4f}",
@@ -802,7 +938,13 @@ def build_view(status: dict) -> dict:
         "ord_html": ord_html,
         "exec_html": exec_html,
         "log_html": log_html,
+        "active_preset": "standard_5m",
+        "active_preset_name": strategy_info["name"],
+        "active_preset_badge": strategy_info["badge"],
+        "target_preset": "",
+        "switch_btn_label": "",
     }
+
 
 
 _config_lock = threading.Lock()
@@ -849,16 +991,19 @@ def render_config_body() -> str:
     for pair in view["pairs"]:
         rows.append(
             "<tr class=\"pair-row\" data-file=\"{file}\">"
-            "<td>{pair}</td>"
-            "<td><input data-k=\"leverage\" value=\"{leverage}\" inputmode=\"numeric\" autocomplete=\"off\"></td>"
-            "<td><input data-k=\"total_amount_quote\" value=\"{amount}\" inputmode=\"decimal\" autocomplete=\"off\"></td>"
-            "<td><input data-k=\"take_profit_quote\" value=\"{tp}\" inputmode=\"decimal\" autocomplete=\"off\"></td>"
+            "<td><div class=\"pair-cell\">{pair} <span class=\"pair-name\">{trading_pair}</span></div></td>"
+            "<td><input class=\"tbl-input num\" data-k=\"leverage\" value=\"{leverage}\" inputmode=\"numeric\" autocomplete=\"off\"></td>"
+            "<td><input class=\"tbl-input num\" data-k=\"total_amount_quote\" value=\"{amount}\" inputmode=\"decimal\" autocomplete=\"off\"></td>"
+            "<td><input class=\"tbl-input num\" data-k=\"take_profit_quote\" value=\"{tp}\" inputmode=\"decimal\" autocomplete=\"off\"></td>"
+            "<td><input class=\"tbl-input num\" data-k=\"fixed_unrealized_tp_quote\" value=\"{fixed_tp}\" inputmode=\"decimal\" autocomplete=\"off\" placeholder=\"例如 2.0\"></td>"
             "</tr>".format(
                 file=html.escape(pair["file"]),
-                pair=pair_label(pair["trading_pair"]) + "  " + html.escape(pair["trading_pair"]),
-                leverage=html.escape(pair["leverage"]),
-                amount=html.escape(pair["total_amount_quote"]),
-                tp=html.escape(pair["take_profit_quote"]),
+                pair=pair_label(pair["trading_pair"]),
+                trading_pair=html.escape(pair["trading_pair"]),
+                leverage=html.escape(str(pair["leverage"])),
+                amount=html.escape(str(pair["total_amount_quote"])),
+                tp=html.escape(str(pair["take_profit_quote"])),
+                fixed_tp=html.escape(str(pair.get("fixed_unrealized_tp_quote", "2"))),
             )
         )
     shared_controls = "".join(
@@ -869,40 +1014,90 @@ def render_config_body() -> str:
     mixed_html = ""
     if mixed:
         mixed_html = (
-            '<p class="hint warn">这些参数在各币种间不一致，保存后会写成同一个值：'
-            + html.escape("、".join(mixed)) + "</p>"
+            '<div class="alert-box warn">⚠️ 这些参数在各币种间不一致，保存后将统一更新为下方数值：'
+            + html.escape("、".join(mixed)) + "</div>"
         )
+
+    strategy = view.get("strategy") or STRATEGY_INFO
+
     return f"""
         <form id="config-form">
-          <div class="card">
-            <h2>// LEVERAGE</h2>
-            <p class="hint">杠杆默认 3，允许 1 到 5。填好后点「应用到全部币种」，或在下表逐个修改。</p>
-            <div class="inline-form">
-              <label class="field"><span>统一杠杆</span>
-                <input id="apply-leverage" value="3" inputmode="numeric" autocomplete="off">
-              </label>
-              <button type="button" id="apply-leverage-btn">应用到全部币种</button>
+          <div class="workbench-panel">
+            <div class="workbench-panel-head">
+              <h2 class="workbench-panel-title">⚙️ 当前运行策略模型 Strategy Overview</h2>
+              <span class="badge green"><span class="status-dot"></span>生效中</span>
+            </div>
+            <div style="padding: 14px 16px;">
+              <div class="strategy-meta-grid">
+                <div class="meta-box">
+                  <span class="meta-box-label">策略模型</span>
+                  <span class="meta-box-val">{html.escape(strategy["name"])}</span>
+                </div>
+                <div class="meta-box">
+                  <span class="meta-box-label">K 线周期</span>
+                  <span class="meta-box-val">{html.escape(strategy["interval"])}</span>
+                </div>
+                <div class="meta-box">
+                  <span class="meta-box-label">均值窗口</span>
+                  <span class="meta-box-val">{strategy["mean_window"]} 根 ({strategy["mean_window"] * 5 // 60} 小时)</span>
+                </div>
+                <div class="meta-box">
+                  <span class="meta-box-label">单笔持仓时限</span>
+                  <span class="meta-box-val">{strategy["time_limit"]} 秒 ({strategy["time_limit"] // 60} 分钟)</span>
+                </div>
+              </div>
+              <p style="font-size: 12px; color: var(--color-muted); line-height: 1.5;">{html.escape(strategy["description"])}</p>
             </div>
           </div>
-          <div class="card">
-            <h2>// ORDER SIZE</h2>
-            <p class="hint">开单金额是单笔最大名义本金（USDT），不是保证金。止盈是单笔锁定的现金利润。</p>
-            <table>
-              <thead><tr>
-                <th>PAIR</th><th>LEVERAGE</th><th>NOTIONAL USDT</th><th>CASH TP</th>
-              </tr></thead>
-              <tbody>{''.join(rows)}</tbody>
-            </table>
+
+          <div class="workbench-panel">
+            <div class="workbench-panel-head">
+              <h2 class="workbench-panel-title">⚖️ 批量与各币种仓位配置 Leverage & Allocation</h2>
+              <div class="quick-bar" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+                <div style="display:inline-flex;gap:6px;align-items:center;">
+                  <span style="font-size: 11px; color: var(--color-muted);">批量杠杆:</span>
+                  <input id="apply-leverage" class="tbl-input mini-input" value="3" inputmode="numeric" autocomplete="off" placeholder="3">
+                  <button type="button" id="apply-leverage-btn" class="btn btn-secondary">应用全部</button>
+                </div>
+                <div style="display:inline-flex;gap:6px;align-items:center;">
+                  <span style="font-size: 11px; color: var(--color-muted);">批量固定浮盈止盈(&gt;1):</span>
+                  <input id="apply-fixed-tp" class="tbl-input mini-input" value="2" inputmode="decimal" autocomplete="off" placeholder="2">
+                  <button type="button" id="apply-fixed-tp-btn" class="btn btn-secondary">应用全部</button>
+                </div>
+              </div>
+            </div>
+            <div style="padding: 14px 16px;">
+              <p style="font-size: 11.5px; color: var(--color-muted); margin-bottom: 12px;">开单金额为单笔最大名义本金（USDT），非保证金占用；各币种杠杆支持根据波动率单独设置（1x–5x）。止盈按单笔价格浮盈触发市价平仓；固定浮盈平仓（&gt;1 USDT）在性能矩阵浮盈达到设定值时立即平仓。</p>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr>
+                    <th>交易对 PAIR</th>
+                    <th>杠杆 LEVERAGE</th>
+                    <th>名义仓位上限 TOTAL (USDT)</th>
+                    <th>现金止盈 CASH TP (USDT)</th>
+                    <th>固定浮盈平仓 FIXED TP (USDT, &gt;1)</th>
+                  </tr></thead>
+                  <tbody>{''.join(rows)}</tbody>
+                </table>
+              </div>
+            </div>
           </div>
-          <div class="card">
-            <h2>// STRATEGY PARAMS</h2>
-            <p class="hint">下面的参数对当前启用的全部币种生效。保存写入 conf/controllers，重启策略后才会用于实盘。</p>
-            {mixed_html}
-            <div class="field-grid">{shared_controls}</div>
+
+          <div class="workbench-panel">
+            <div class="workbench-panel-head">
+              <h2 class="workbench-panel-title">🛡️ 全局核心策略与风控参数 Risk & Model Parameters</h2>
+              <span class="workbench-panel-meta">统一调度参数</span>
+            </div>
+            <div style="padding: 14px 16px;">
+              <p style="font-size: 11.5px; color: var(--color-muted);">以下参数对当前启用的全部币种生效。修改后保存将写入 conf/controllers，重启交易机器人后生效。</p>
+              {mixed_html}
+              <div class="field-grid">{shared_controls}</div>
+            </div>
           </div>
-          <div class="save-bar">
-            <button type="submit" class="save">保存配置</button>
-            <span id="config-msg" class="hint"></span>
+
+          <div class="sticky-actions-bar">
+            <button type="submit" class="btn btn-primary">💾 保存全部配置</button>
+            <span id="config-msg" class="save-msg"></span>
           </div>
         </form>
         <script>
@@ -912,6 +1107,10 @@ def render_config_body() -> str:
             document.getElementById('apply-leverage-btn').onclick = function() {{
               var value = document.getElementById('apply-leverage').value || '3';
               document.querySelectorAll('[data-k="leverage"]').forEach(function(el) {{ el.value = value; }});
+            }};
+            document.getElementById('apply-fixed-tp-btn').onclick = function() {{
+              var value = document.getElementById('apply-fixed-tp').value || '2';
+              document.querySelectorAll('[data-k="fixed_unrealized_tp_quote"]').forEach(function(el) {{ el.value = value; }});
             }};
             form.onsubmit = function(event) {{
               event.preventDefault();
@@ -924,20 +1123,28 @@ def render_config_body() -> str:
               document.querySelectorAll('[data-shared]').forEach(function(el) {{
                 shared[el.getAttribute('data-shared')] = el.value;
               }});
-              msg.className = 'hint';
-              msg.textContent = '保存中...';
+              msg.className = 'save-msg saving';
+              msg.textContent = '正在保存写入配置...';
               fetch('/api/config', {{
                 method: 'POST',
-                headers: {{ 'Content-Type': 'application/json' }},
+                headers: {{
+                  'Content-Type': 'application/json',
+                  'X-Requested-With': 'OKX-Dashboard'
+                }},
                 body: JSON.stringify({{ pairs: pairs, shared: shared }})
               }}).then(function(response) {{
                 return response.json().then(function(data) {{ return {{ ok: response.ok, data: data }}; }});
               }}).then(function(result) {{
-                msg.className = result.ok && result.data.ok ? 'hint ok' : 'hint warn';
-                msg.textContent = (result.data && result.data.message) || '保存失败';
+                if (result.ok && result.data.ok) {{
+                  msg.className = 'save-msg ok';
+                  msg.textContent = '✅ ' + (result.data.message || '配置已成功保存！');
+                }} else {{
+                  msg.className = 'save-msg err';
+                  msg.textContent = '❌ ' + ((result.data && result.data.message) || '保存失败');
+                }}
               }}).catch(function() {{
-                msg.className = 'hint warn';
-                msg.textContent = '保存失败';
+                msg.className = 'save-msg err';
+                msg.textContent = '❌ 保存请求异常，请检查网络或日志';
               }});
             }};
           }})();
@@ -949,867 +1156,1673 @@ def markets_view(status: dict) -> dict:
     err = status.get("error")
     if err:
         return {"error": str(err), "markets_html": "", "markets_meta": ""}
-    html, meta = build_markets(strategy_pairs(status, parse_performance_table(status)))
-    return {"error": None, "markets_html": html, "markets_meta": meta}
+    html_content, meta = build_markets(strategy_pairs(status, parse_performance_table(status)))
+    return {"error": None, "markets_html": html_content, "markets_meta": meta}
 
 
 def render_html(status: dict, page: str = "dashboard") -> str:
-    if page == "config":
-        view = {}
-        body = render_config_body()
-    else:
-        view = markets_view(status) if page == "markets" else build_view(status)
-    if page != "config" and view.get("error"):
-        body = f'<div class="card error">⚠️ 无法读取状态文件: {view["error"]}</div>'
+    if not status:
+        status = read_status()
+    view = build_view(status)
+    markets_data = markets_view(status)
+    config_body = render_config_body()
+    strategy_info = get_strategy_info()
+    strategy_badge = strategy_info.get("badge", "5M MEAN REVERSION")
+    
+    # Active tab based on route
+    active_tab = "overview"
+    if page == "markets":
+        active_tab = "markets"
     elif page == "config":
-        pass
-    elif page == "markets":
-        body = f"""
-        <div class="card span-full">
-          <h2>// MARKETS <span class="section-meta" id="markets-meta">{view["markets_meta"]}</span></h2>
-          <table>
-            <thead><tr>
-              <th>PAIR</th><th>LAST</th><th>24H</th><th>BID</th><th>ASK</th>
-              <th>SPREAD</th><th>HIGH 24H</th><th>LOW 24H</th><th>VOL 24H</th>
-            </tr></thead>
-            <tbody id="markets-body">{view["markets_html"]}</tbody>
-          </table>
-        </div>"""
-    else:
-        age_label = fmt_snapshot_age(
-            (time.time() - view["updated_at"]) if view["updated_at"] else None
-        )
-        stale_cls = "neg" if view["stale"] else ""
-        body = f"""
-        <div id="stale-banner">{view["stale_html"]}</div>
-        <div class="info-bar">
-          <div class="info-card">
-            <div class="label">STATUS</div>
-            <div class="value" id="status-badge">{view["status_html"]}</div>
-          </div>
-          <div class="info-card">
-            <div class="label">STRATEGY</div>
-            <div class="value" id="strategy">{view["strategy"]}</div>
-          </div>
-          <div class="info-card">
-            <div class="label">UPTIME</div>
-            <div class="value" id="uptime">{fmt_uptime(view["uptime_s"])}</div>
-          </div>
-          <div class="info-card">
-            <div class="label">USDT BAL</div>
-            <div class="value" id="usdt-bal">{view["usdt_bal"]}</div>
-          </div>
-          <div class="info-card">
-            <div class="label">GLOBAL PNL</div>
-            <div class="value {view["global_pnl_cls"]}" id="global-pnl">{view["global_pnl_html"]}</div>
-          </div>
-          <div class="info-card">
-            <div class="label">REAL / UNREAL</div>
-            <div class="value">
-              <span id="realized" class="{view["realized_cls"]}">{view["realized_html"]}</span> /
-              <span id="unrealized" class="{view["unrealized_cls"]}">{view["unrealized_html"]}</span>
-            </div>
-          </div>
-          <div class="info-card">
-            <div class="label">SNAPSHOT <span id="snapshot-badge">{view["snapshot_badge_html"]}</span></div>
-            <div class="value {stale_cls}" id="snapshot-age">{age_label}</div>
-          </div>
-        </div>
-        <div class="card span-full">
-          <h2>// PERFORMANCE</h2>
-          <table>
-            <thead><tr>
-              <th>CONTROLLER</th><th>Z-SCORE</th><th>REALIZED</th><th>UNREALIZED</th>
-              <th>GLOBAL PNL</th><th>PNL%</th><th>VOLUME(USDT)</th>
-            </tr></thead>
-            <tbody id="perf-body">{view["perf_html"]}</tbody>
-          </table>
-        </div>
-        <div class="card span-full">
-          <h2>// POSITIONS</h2>
-          <p class="hint" id="manual-close-note">{html.escape(view.get("manual_close_note") or "")}</p>
-          <div id="manual-close-dialog" class="manual-dialog" hidden>
-            <p id="manual-close-title">填写这笔开单的最终盈亏</p>
-            <label>最终盈亏 USDT <input id="manual-close-pnl" inputmode="decimal" autocomplete="off" placeholder="例如 1.25 或 -0.40"></label>
-            <button type="button" id="manual-close-save">计入盈亏</button>
-            <button type="button" id="manual-close-zero">不输入，记为 0</button>
-            <button type="button" id="manual-close-cancel">取消</button>
-          </div>
-          <table>
-            <thead><tr>
-              <th>PAIR</th><th></th><th>SIDE</th><th>AMT</th><th>VALUE</th>
-              <th>BREAKEVEN</th><th>UNREAL PNL</th><th>REAL PNL</th><th>FEE</th>
-            </tr></thead>
-            <tbody id="pos-body">{view["pos_html"]}</tbody>
-          </table>
-        </div>
-        <div class="card span-full">
-          <h2>// OPEN ORDERS</h2>
-          <table>
-            <thead><tr>
-              <th>PAIR</th><th>SIDE</th><th>PRICE</th><th>AMT</th><th>AGE</th>
-            </tr></thead>
-            <tbody id="ord-body">{view["ord_html"]}</tbody>
-          </table>
-        </div>
-        <div class="card span-full">
-          <h2>// EXECUTORS</h2>
-          <table>
-            <thead><tr>
-              <th>CTRL</th><th>SIDE</th><th>STATUS</th><th>NET PNL</th>
-              <th>PNL%</th><th>VOLUME</th><th>LIVE</th><th>CLOSE TYPE</th><th>AGE</th>
-            </tr></thead>
-            <tbody id="exec-body">{view["exec_html"]}</tbody>
-          </table>
-        </div>
-        <div class="card span-full">
-          <h2>// LOG TAIL (60)</h2>
-          <div class="log-box" id="logbox">{view["log_html"]}</div>
-        </div>"""
+        active_tab = "config"
 
     now_str = time.strftime("%H:%M:%S")
-    titles = {
-        "markets": ("OKX QUANT // MARKETS", "MARKETS"),
-        "config": ("OKX QUANT // CONFIG", "CONFIG"),
-    }
-    page_title, heading = titles.get(page, ("OKX QUANT // DASHBOARD", "LIVE DASHBOARD"))
-    nav_links = []
-    for key, href, label in (
-        ("dashboard", "/", "DASHBOARD"),
-        ("markets", "/markets", "MARKETS"),
-        ("config", "/config", "CONFIG"),
-    ):
-        active = "active" if page == key else ""
-        nav_links.append(f'<a href="{href}" class="{active}">{label}</a>')
-    nav_html = "\n      ".join(nav_links)
-    footer = (
-        "[ LOCAL CONFIG // RESTART STRATEGY TO APPLY ]"
-        if page == "config"
-        else "[ READ-ONLY MONITOR // NO TRADE SIDE EFFECTS ]"
+    age_label = fmt_snapshot_age(
+        (time.time() - view["updated_at"]) if view.get("updated_at") else None
     )
+    stale_cls = "neg" if view.get("stale") else ""
+
     return f"""<!DOCTYPE html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{page_title}</title>
+  <title>OKX QUANTITATIVE TRADER // INSTITUTIONAL TERMINAL</title>
   <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#000000">
+  <meta name="theme-color" content="#060709">
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=VT323&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
     :root {{
-      --bg: #090c0d;
-      --bg-raised: #0d1112;
-      --panel: #111617;
-      --panel-hover: #151b1c;
-      --border: #273033;
-      --border-strong: #3a4649;
-      --text: #edf3f2;
-      --text-soft: #b3bfbd;
-      --muted: #778583;
-      --pos: #43d9a3;
-      --neg: #ff6b6b;
-      --zero: #73807e;
-      --accent: #31c7c4;
-      --accent-strong: #87f0ec;
-      --accent-wash: rgba(49, 199, 196, 0.1);
-      --warn: #f1b85b;
-      --radius: 14px;
-      --radius-control: 10px;
-      --font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
-      --font-mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+      --bg-canvas: #060709;
+      --bg-surface: #0c0e14;
+      --bg-surface-hover: #121520;
+      --bg-card: #0f121a;
+      --bg-elevated: #161a25;
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --border-focus: rgba(255, 255, 255, 0.20);
+      --border-glow: rgba(56, 189, 248, 0.25);
+      
+      --color-ink: #f8fafc;
+      --color-ink-muted: #94a3b8;
+      --color-ink-faint: #64748b;
+      
+      --color-pos: #10b981;
+      --color-pos-bg: rgba(16, 185, 129, 0.12);
+      --color-neg: #f43f5e;
+      --color-neg-bg: rgba(244, 63, 94, 0.12);
+      --color-accent: #38bdf8;
+      --color-accent-bg: rgba(56, 189, 248, 0.12);
+      --color-gold: #e2b714;
+      --color-gold-bg: rgba(226, 183, 20, 0.12);
+      
+      --font-serif: "Times New Roman", Times, "Songti SC", "SimSun", serif;
+      --font-mono: "Times New Roman", Times, "Courier New", monospace;
     }}
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    html {{ background: var(--bg); }}
+
+    *, *::before, *::after {{
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }}
+
     body {{
-      min-height: 100dvh;
-      background:
-        radial-gradient(circle at 16% -12%, rgba(49,199,196,0.08), transparent 34rem),
-        var(--bg);
-      color: var(--text);
-      font-family: var(--font-sans);
+      background-color: var(--bg-canvas);
+      background-image: 
+        radial-gradient(ellipse 70% 35% at 50% -10%, rgba(56, 189, 248, 0.07), transparent 70%),
+        linear-gradient(to right, rgba(255, 255, 255, 0.015) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(255, 255, 255, 0.015) 1px, transparent 1px);
+      background-size: 100% 100%, 32px 32px, 32px 32px;
+      color: var(--color-ink);
+      font-family: var(--font-serif);
       font-size: 14px;
-      line-height: 1.45;
+      line-height: 1.5;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
       -webkit-font-smoothing: antialiased;
     }}
-    a, button, input, select {{ -webkit-tap-highlight-color: transparent; }}
-    a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible {{
-      outline: 2px solid var(--accent-strong);
-      outline-offset: 2px;
+
+    /* ─── Top Institutional Header ─── */
+    .site-header {{
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(6, 7, 9, 0.88);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 0 24px;
+      height: 56px;
     }}
-    header {{
-      position: sticky; top: 0; z-index: 50;
-      display: grid;
-      grid-template-columns: minmax(230px, 1fr) auto minmax(230px, 1fr);
-      align-items: center; gap: 18px;
-      min-height: 72px; padding: 12px 24px;
-      border-bottom: 1px solid var(--border);
-      background: rgba(9, 12, 13, 0.92);
-      backdrop-filter: blur(18px) saturate(125%);
-      -webkit-backdrop-filter: blur(18px) saturate(125%);
+
+    .brand-section {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 260px;
     }}
-    .brand {{ display: flex; align-items: center; gap: 12px; min-width: 0; }}
-    .brand-mark {{
-      display: grid; place-items: center; flex: 0 0 38px; height: 38px;
-      border: 1px solid var(--accent); border-radius: var(--radius-control);
-      background: var(--accent-wash); color: var(--accent-strong);
-      font: 700 12px/1 var(--font-mono); letter-spacing: -0.04em;
+
+    .brand-logo-svg {{
+      flex-shrink: 0;
+      display: block;
     }}
-    header h1 {{
-      min-width: 0; color: var(--text);
-      font-size: 15px; font-weight: 650; line-height: 1.2;
-      letter-spacing: -0.01em;
+
+    .brand-titles {{
+      display: flex;
+      flex-direction: column;
     }}
-    header h1 a {{ color: inherit; text-decoration: none; }}
-    .brand-kicker {{
-      display: block; margin-top: 3px; color: var(--muted);
-      font: 500 10px/1.2 var(--font-mono); letter-spacing: 0.09em;
+
+    .brand-main {{
+      font-family: var(--font-serif);
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.10em;
+      color: var(--color-ink);
+      text-transform: uppercase;
+      text-decoration: none;
+    }}
+
+    .brand-sub {{
+      font-size: 11px;
+      color: var(--color-ink-muted);
+      letter-spacing: 0.06em;
       text-transform: uppercase;
     }}
-    .nav {{
-      display: flex; gap: 3px; align-items: center;
-      padding: 4px; border: 1px solid var(--border);
-      border-radius: var(--radius-control); background: var(--bg-raised);
+
+    /* ─── Tab Strip (Strictly NO EMOJIS) ─── */
+    .tab-strip {{
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      background: rgba(255, 255, 255, 0.03);
+      padding: 3px 4px;
+      border-radius: 6px;
+      border: 1px solid var(--border-subtle);
     }}
-    .nav a {{
-      color: var(--muted); text-decoration: none; white-space: nowrap;
-      border-radius: 7px; padding: 7px 12px;
-      font-size: 12px; font-weight: 650; letter-spacing: 0.04em;
-    }}
-    .nav a:hover {{ color: var(--text); background: var(--panel); }}
-    .nav a.active {{ color: #061313; background: var(--accent); }}
-    .header-tools {{ display: flex; justify-content: flex-end; align-items: center; gap: 8px; }}
-    .nav .restart, .nav .stop {{ display: none; }}
-    .control-btn {{
-      min-height: 36px; padding: 0 12px; white-space: nowrap;
-      border-radius: var(--radius-control); background: transparent;
-      font: 650 11px/1 var(--font-sans); letter-spacing: 0.04em;
-    }}
-    .control-btn.restart {{ color: var(--warn); border-color: rgba(241,184,91,0.55); }}
-    .control-btn.restart:hover {{ color: #171006; background: var(--warn); border-color: var(--warn); }}
-    .control-btn.stop {{ color: var(--neg); border-color: rgba(255,107,107,0.55); }}
-    .control-btn.stop:hover {{ color: #180707; background: var(--neg); border-color: var(--neg); }}
-    .control-btn:disabled {{ color: var(--muted); border-color: var(--border); background: transparent; cursor: wait; }}
-    .manual-close {{
-      min-height: 28px; padding: 0 8px; white-space: nowrap; cursor: pointer;
-      color: var(--warn); border: 1px solid rgba(241,184,91,0.55); background: transparent;
-      border-radius: var(--radius-control); font: 650 11px/1 var(--font-sans); letter-spacing: 0.04em;
-    }}
-    .manual-close:hover {{ color: #171006; background: var(--warn); border-color: var(--warn); }}
-    .manual-close:disabled {{ color: var(--muted); border-color: var(--border); cursor: wait; }}
-    #manual-close-note:empty {{ display: none; margin: 0; }}
-    .manual-dialog {{
-      display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
-      margin: 0 16px 12px; padding: 12px; border: 1px solid var(--warn);
-    }}
-    .manual-dialog[hidden] {{ display: none; }}
-    .manual-dialog p {{ margin: 0; color: var(--warn); }}
-    .manual-dialog label {{ color: var(--text-soft); font-size: 12px; }}
-    .manual-dialog input {{
-      width: 11rem; min-height: 32px; margin-left: 8px; background: var(--bg); color: var(--text);
-      border: 1px solid var(--border); border-radius: var(--radius-control); padding: 4px 8px;
-      font: 500 13px/1 var(--font-mono);
-    }}
-    .manual-dialog button {{
-      min-height: 32px; padding: 0 10px; cursor: pointer; background: transparent;
-      border: 1px solid var(--border); color: var(--text); border-radius: var(--radius-control);
-      font: 650 11px/1 var(--font-sans);
-    }}
-    #manual-close-save {{ color: var(--pos); border-color: var(--pos); }}
-    #manual-close-zero {{ color: var(--warn); border-color: var(--warn); }}
-    .hint {{ color: var(--muted); font-size: 13px; margin: 0 0 14px; max-width: 76ch; }}
-    .hint.ok {{ color: var(--pos); }}
-    .hint.warn {{ color: var(--warn); }}
-    .field-grid {{
-      display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px;
-    }}
-    .field span {{
-      display: block; color: var(--text-soft); font-size: 11px; font-weight: 650;
-      margin-bottom: 7px; letter-spacing: 0.06em; text-transform: uppercase;
-    }}
-    .field input, .field select, td input {{
-      width: 100%; min-height: 40px; background: var(--bg); color: var(--text);
-      border: 1px solid var(--border); border-radius: var(--radius-control);
-      font: 500 13px/1 var(--font-mono); padding: 8px 10px;
-    }}
-    .field input:hover, .field select:hover, td input:hover {{ border-color: var(--border-strong); }}
-    .field input:focus, .field select:focus, td input:focus {{ border-color: var(--accent); }}
-    td input {{ width: 8rem; min-height: 36px; }}
-    .inline-form {{ display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }}
-    .inline-form .field {{ width: 9rem; }}
-    button, .save {{
-      min-height: 40px; background: var(--accent); color: #061313;
-      border: 1px solid var(--accent); border-radius: var(--radius-control);
-      font-family: var(--font-sans); font-size: 13px; font-weight: 700;
-      padding: 8px 15px; cursor: pointer; transition: transform 120ms ease, background 120ms ease;
-    }}
-    button:hover, .save:hover {{ background: var(--accent-strong); }}
-    button:active, .save:active {{ transform: translateY(1px); }}
-    .save-bar {{
-      display: flex; gap: 14px; align-items: center; width: fit-content;
-      margin: 8px 0 4px; padding: 8px;
-      border: 1px solid var(--border); border-radius: var(--radius);
-      background: var(--bg-raised);
-    }}
-    .save-bar .hint {{ margin: 0; }}
-    .refresh-info {{
-      color: var(--muted); white-space: nowrap;
-      font: 500 10px/1 var(--font-mono); letter-spacing: 0.07em;
-    }}
-    .refresh-info::before {{
-      content: ''; display: inline-block; width: 6px; height: 6px; margin-right: 7px;
-      border-radius: 50%; background: var(--pos); box-shadow: 0 0 0 4px rgba(67,217,163,0.08);
-      vertical-align: 1px;
-    }}
-    .container {{ max-width: 1680px; margin: 0 auto; padding: 24px; }}
-    .info-bar {{
-      display: grid; grid-template-columns: repeat(7, minmax(150px, 1fr));
-      gap: 10px; margin-bottom: 16px;
-    }}
-    .info-card {{
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: var(--radius); padding: 16px;
-      box-shadow: inset 0 1px rgba(255,255,255,0.025);
-    }}
-    .info-card .label {{
-      color: var(--muted); font-size: 10px; font-weight: 700; margin-bottom: 12px;
-      text-transform: uppercase; letter-spacing: 0.09em;
-    }}
-    .info-card .value {{
-      color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-      font: 600 18px/1.25 var(--font-mono); letter-spacing: -0.035em;
-      font-variant-numeric: tabular-nums;
-    }}
-    .info-card .badge {{ vertical-align: 2px; }}
-    .card {{
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: var(--radius); padding: 0;
-      margin-bottom: 12px;
-      overflow-x: auto;
-      box-shadow: inset 0 1px rgba(255,255,255,0.025);
-    }}
-    .card.error {{ color: var(--warn); border-color: rgba(241,184,91,0.5); padding: 18px; }}
-    .card h2 {{
-      position: sticky; left: 0;
-      font-size: 12px; font-weight: 750; color: var(--text); margin: 0;
-      padding: 14px 16px;
-      border-bottom: 1px solid var(--border);
-      text-transform: uppercase; letter-spacing: 0.075em;
-    }}
-    .card h2::before {{ content: ''; display: inline-block; width: 3px; height: 12px; margin-right: 9px; border-radius: 2px; background: var(--accent); vertical-align: -1px; }}
-    .section-meta {{
-      color: var(--muted); font: 500 10px/1 var(--font-mono); letter-spacing: 0.04em;
-      text-transform: none; margin-left: 8px;
-    }}
-    .card > .hint, .card > .inline-form, .card > .field-grid {{ margin-left: 16px; margin-right: 16px; }}
-    .card > .hint {{ margin-top: 16px; }}
-    .card > .inline-form, .card > .field-grid {{ margin-bottom: 18px; }}
-    table {{ width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }}
-    th {{
-      color: var(--muted); font: 700 10px/1.25 var(--font-sans); text-align: left;
-      padding: 11px 16px; border-bottom: 1px solid var(--border);
-      white-space: nowrap; text-transform: uppercase; letter-spacing: 0.065em;
-    }}
-    td {{
-      color: var(--text-soft); font: 500 12px/1.35 var(--font-mono);
-      padding: 10px 16px; border-bottom: 1px solid rgba(39,48,51,0.62); white-space: nowrap;
-    }}
-    tr:last-child td {{ border-bottom: none; }}
-    tbody tr:hover td {{ background: var(--panel-hover); color: var(--text); }}
-    .total-row td {{ background: var(--accent-wash); color: var(--accent-strong); font-weight: 700; }}
-    .pos  {{ color: var(--pos); }}
-    .neg  {{ color: var(--neg); }}
-    .zero {{ color: var(--zero); }}
-    .center {{ text-align: center; }}
-    .empty {{ color: var(--muted); text-align: center; padding: 24px 0; font: 500 11px/1 var(--font-mono); }}
-    .badge {{
-      display: inline-flex; align-items: center; min-height: 22px; padding: 2px 8px;
-      border: 1px solid currentColor; border-radius: 999px;
-      font: 700 10px/1 var(--font-sans); letter-spacing: 0.055em;
-    }}
-    .badge.green  {{ color: var(--pos); background: rgba(67,217,163,0.08); }}
-    .badge.red    {{ color: var(--neg); background: rgba(255,107,107,0.08); }}
-    .badge.yellow {{ color: var(--warn); background: rgba(241,184,91,0.08); }}
-    .badge.gray   {{ color: var(--muted); background: rgba(119,133,131,0.08); }}
-    .log-box {{
-      background: var(--bg); padding: 14px 16px; max-height: 340px; overflow-y: auto;
-      font: 400 11px/1.62 var(--font-mono);
-    }}
-    .log-line {{ color: #667472; word-break: break-all; }}
-    .log-warn  {{ color: var(--warn); }}
-    footer {{
-      max-width: 1680px; margin: 0 auto; padding: 4px 24px 24px;
-      color: var(--muted); font: 500 10px/1.4 var(--font-mono); letter-spacing: 0.04em;
-    }}
-    .cursor {{ color: var(--accent); }}
-    ::-webkit-scrollbar {{ width: 8px; height: 8px; background: var(--bg); }}
-    ::-webkit-scrollbar-thumb {{ background: var(--border-strong); border: 2px solid var(--bg); border-radius: 8px; }}
-    @media (max-width: 1320px) {{
-      header {{ grid-template-columns: 1fr auto; }}
-      .nav {{ grid-column: 1 / -1; grid-row: 2; justify-self: stretch; justify-content: center; }}
-      .header-tools {{ grid-column: 2; grid-row: 1; }}
-      .info-bar {{ grid-template-columns: repeat(4, minmax(150px, 1fr)); }}
-    }}
-    @media (max-width: 760px) {{
-      header {{ position: static; grid-template-columns: 1fr; gap: 10px; padding: 14px 16px; }}
-      .brand {{ grid-column: 1; grid-row: 1; }}
-      .refresh-info {{ margin-left: auto; }}
-      .brand .refresh-info {{ display: block; }}
-      header > .refresh-info {{ display: none; }}
-      .nav {{ grid-column: 1; grid-row: 2; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }}
-      .nav a {{ min-width: 0; text-align: center; }}
-      .header-tools {{ grid-column: 1; grid-row: 3; display: grid; grid-template-columns: 1fr 1fr; }}
-      .header-tools .refresh-info {{ grid-column: 1 / -1; margin: 0 0 2px; }}
-      .container {{ padding: 16px; }}
-      .info-bar {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-      .info-card {{ padding: 14px; }}
-      .info-card .value {{ font-size: 16px; }}
-      th, td {{ padding-left: 14px; padding-right: 14px; }}
-      .save-bar {{ width: 100%; flex-wrap: wrap; }}
-      footer {{ padding: 4px 16px 20px; }}
-    }}
-    @media (max-width: 430px) {{
-      .info-bar {{ grid-template-columns: 1fr; }}
-      .nav a {{ padding-left: 9px; padding-right: 9px; }}
-    }}
-    @media (prefers-reduced-motion: reduce) {{
-      *, *::before, *::after {{ scroll-behavior: auto !important; transition: none !important; animation: none !important; }}
-    }}
-    /* Preserve the original terminal visual language; layout rules above remain responsive. */
-    :root {{
-      --bg: #000000;
-      --bg-raised: #000000;
-      --panel: #0a0a0a;
-      --panel-hover: #0d0d0d;
-      --border: #1a1a1a;
-      --border-strong: #222222;
-      --text: #c8c8c8;
-      --text-soft: #c8c8c8;
-      --muted: #555555;
-      --pos: #00ff41;
-      --neg: #ff2222;
-      --zero: #444444;
-      --accent: #00e5ff;
-      --accent-strong: #00e5ff;
-      --accent-wash: #041418;
-      --warn: #ffaa00;
-      --radius: 0px;
-      --radius-control: 0px;
-      --font-sans: 'VT323', monospace;
-      --font-mono: 'VT323', monospace;
-    }}
-    body {{
-      background: var(--bg); font-family: 'VT323', monospace;
-      font-size: 20px; line-height: 1.5; letter-spacing: 0.04em;
-    }}
-    body::after {{
-      content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 9999;
-      background: repeating-linear-gradient(
-        to bottom, transparent 0px, transparent 3px,
-        rgba(0,0,0,0.12) 3px, rgba(0,0,0,0.12) 4px
-      );
-    }}
-    header {{
-      border-bottom: 2px solid var(--accent); background: var(--bg);
-      backdrop-filter: none; -webkit-backdrop-filter: none;
-    }}
-    .brand-mark, .brand-kicker {{ display: none; }}
-    header h1 {{
-      font-size: 28px; font-weight: 400; color: var(--accent);
-      text-shadow: 0 0 10px var(--accent), 0 0 2px #fff;
+
+    .tab-btn {{
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 14px;
+      border-radius: 4px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--color-ink-muted);
+      font-family: var(--font-serif);
+      font-size: 12px;
+      font-weight: 600;
       letter-spacing: 0.08em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      white-space: nowrap;
     }}
-    .nav {{ gap: 8px; padding: 0; border: 0; background: transparent; border-radius: 0; }}
-    .nav a {{
-      color: var(--muted); border: 1px solid var(--border); border-radius: 0;
-      padding: 3px 13px; font-size: 20px; font-weight: 400; letter-spacing: 0.08em;
+
+    .tab-btn:hover {{
+      color: var(--color-ink);
+      background: rgba(255, 255, 255, 0.04);
     }}
-    .nav a:hover, .nav a.active {{ color: var(--accent); border-color: var(--accent); background: transparent; }}
-    .header-tools {{ gap: 8px; }}
-    .refresh-info {{ color: var(--muted); font-size: 16px; letter-spacing: 0.06em; }}
-    .refresh-info::before {{ display: none; }}
-    .control-btn {{
-      min-height: auto; border-radius: 0; background: #000;
-      font: 400 20px/1.2 'VT323', monospace; padding: 3px 13px;
+
+    .tab-btn.active {{
+      color: var(--color-ink);
+      background: var(--bg-elevated);
+      border-color: rgba(255, 255, 255, 0.12);
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
     }}
-    .control-btn.restart {{ color: var(--warn); border-color: var(--warn); }}
-    .control-btn.restart:hover {{ color: #000; background: var(--warn); }}
-    .control-btn.stop {{ color: var(--neg); border-color: var(--neg); }}
-    .control-btn.stop:hover {{ color: #000; background: var(--neg); }}
-    .manual-close {{
-      min-height: 32px; border-radius: 0; background: #000;
-      font: 400 18px/1 'VT323', monospace; color: var(--warn); border-color: var(--warn);
+
+    .tab-icon {{
+      stroke-width: 1.8;
+      opacity: 0.85;
     }}
-    .manual-close:hover {{ color: #000; background: var(--warn); }}
-    .container {{ max-width: 1600px; padding: 14px 18px; }}
-    .info-bar {{ gap: 8px; margin-bottom: 14px; }}
-    .info-card {{ border-radius: 0; padding: 14px 16px; box-shadow: none; }}
-    .info-card .label {{ color: var(--muted); font-size: 17px; font-weight: 400; margin-bottom: 6px; letter-spacing: 0.1em; }}
-    .info-card .value {{
-      color: var(--text); font: 400 30px/1.2 'VT323', monospace;
-      letter-spacing: 0.04em; overflow: visible; text-overflow: clip;
+
+    .tab-btn.active .tab-icon {{
+      stroke: var(--color-accent);
+      opacity: 1;
     }}
-    .info-card .badge {{ font-size: 20px; padding: 2px 10px; vertical-align: 0; }}
-    .card {{ border-radius: 0; padding: 12px 16px; margin-bottom: 10px; box-shadow: none; }}
-    .card.error {{ color: var(--warn); border-color: var(--warn); padding: 12px 16px; }}
-    .card h2 {{
-      position: sticky; left: 0; color: var(--accent); font-size: 22px; font-weight: 400;
-      margin-bottom: 10px; padding: 0 0 5px; letter-spacing: 0.1em;
+
+    /* ─── Top Controls & Status Group ─── */
+    .top-status-group {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
     }}
-    .card h2::before {{ display: none; }}
-    .section-meta {{ color: var(--muted); font: 400 15px/1 'VT323', monospace; letter-spacing: 0.06em; }}
-    .card > .hint, .card > .inline-form, .card > .field-grid {{ margin-left: 0; margin-right: 0; }}
-    .card > .hint {{ margin-top: 0; }}
-    .card > .inline-form, .card > .field-grid {{ margin-bottom: 0; }}
-    table {{ font-variant-numeric: normal; }}
-    th {{
-      color: var(--muted); font: 400 15px/1.25 'VT323', monospace;
-      padding: 5px 10px; border-bottom-color: #222; letter-spacing: 0.06em;
+
+    .clock-display {{
+      font-family: var(--font-serif);
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      color: var(--color-ink-faint);
+      padding: 0 4px;
     }}
-    td {{
-      color: var(--text); font: 400 17px/1.35 'VT323', monospace;
-      padding: 4px 10px; border-bottom-color: #111;
-    }}
-    tbody tr:hover td {{ background: #0d0d0d; color: var(--text); }}
-    .total-row td {{ background: #0c0c0c; color: var(--accent); font-weight: 400; }}
-    .pos {{ color: var(--pos); text-shadow: 0 0 6px var(--pos); }}
-    .neg {{ color: var(--neg); text-shadow: 0 0 6px var(--neg); }}
-    .empty {{ color: var(--muted); padding: 12px 0; font: 400 16px/1 'VT323', monospace; }}
+
     .badge {{
-      min-height: auto; padding: 1px 7px; border-radius: 0;
-      font: 400 16px/1.25 'VT323', monospace; letter-spacing: 0.04em; background: transparent;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 7px;
+      border-radius: 3px;
+      font-family: var(--font-serif);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      border: 1px solid transparent;
     }}
-    .badge.green {{ color: var(--pos); background: transparent; }}
-    .badge.red {{ color: var(--neg); background: transparent; }}
-    .badge.yellow {{ color: var(--warn); background: transparent; }}
-    .badge.gray {{ color: var(--muted); background: transparent; }}
-    .coin-label {{
-      display: inline-flex; align-items: center; gap: 8px;
-      min-width: 74px; vertical-align: middle;
+
+    .badge.green {{
+      background: var(--color-pos-bg);
+      color: var(--color-pos);
+      border-color: rgba(16, 185, 129, 0.25);
     }}
+
+    .badge.red {{
+      background: var(--color-neg-bg);
+      color: var(--color-neg);
+      border-color: rgba(244, 63, 94, 0.25);
+    }}
+
+    .badge.yellow {{
+      background: rgba(245, 158, 11, 0.12);
+      color: #f59e0b;
+      border-color: rgba(245, 158, 11, 0.25);
+    }}
+
+    .badge.gray {{
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--color-ink-muted);
+      border-color: var(--border-subtle);
+    }}
+
+    .status-dot {{
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: currentColor;
+    }}
+
+    .snapshot-age-tag {{
+      font-size: 11px;
+      color: var(--color-ink-faint);
+    }}
+
+    .snapshot-age-tag.neg {{
+      color: var(--color-neg);
+      font-weight: 600;
+    }}
+
+    /* ─── Buttons ─── */
+    .btn {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 5px 12px;
+      border-radius: 4px;
+      font-family: var(--font-serif);
+      font-size: 11.5px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      cursor: pointer;
+      border: 1px solid transparent;
+      transition: all 0.15s ease;
+      white-space: nowrap;
+    }}
+
+    .btn-action-warn {{
+      background: rgba(245, 158, 11, 0.08);
+      color: #f59e0b;
+      border-color: rgba(245, 158, 11, 0.3);
+    }}
+
+    .btn-action-warn:hover {{
+      background: rgba(245, 158, 11, 0.18);
+      border-color: #f59e0b;
+    }}
+
+    .btn-action-neg {{
+      background: rgba(244, 63, 94, 0.08);
+      color: #f43f5e;
+      border-color: rgba(244, 63, 94, 0.3);
+    }}
+
+    .btn-action-neg:hover {{
+      background: rgba(244, 63, 94, 0.18);
+      border-color: #f43f5e;
+    }}
+
+    .btn-primary {{
+      background: var(--color-pos);
+      color: #060709;
+      border-color: var(--color-pos);
+    }}
+
+    .btn-primary:hover {{
+      background: #059669;
+    }}
+
+    .btn-secondary {{
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--color-ink);
+      border-color: var(--border-subtle);
+    }}
+
+    .btn-secondary:hover {{
+      background: rgba(255, 255, 255, 0.12);
+    }}
+
+    .btn-subtle {{
+      background: transparent;
+      color: var(--color-ink-muted);
+      border-color: var(--border-subtle);
+    }}
+
+    .btn-subtle:hover {{
+      color: var(--color-ink);
+      background: rgba(255, 255, 255, 0.04);
+    }}
+
+    /* ─── Main Container ─── */
+    .container {{
+      max-width: 1440px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 24px;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }}
+
+    /* ─── Tab Panes ─── */
+    .tab-pane {{
+      display: none;
+      flex-direction: column;
+      gap: 20px;
+    }}
+
+    .tab-pane.active {{
+      display: flex;
+    }}
+
+    /* ─── KPI Stat Ribbon ─── */
+    .stat-ribbon {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }}
+
+    .stat-card {{
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 6px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      position: relative;
+      overflow: hidden;
+      transition: border-color 0.2s ease, transform 0.2s ease;
+    }}
+
+    .stat-card:hover {{
+      border-color: var(--border-focus);
+    }}
+
+    .stat-card.highlight {{
+      border-color: rgba(56, 189, 248, 0.35);
+      background: linear-gradient(135deg, rgba(56, 189, 248, 0.04), transparent 70%), var(--bg-card);
+    }}
+
+    .stat-card.session-card {{
+      border-color: rgba(16, 185, 129, 0.35);
+      background: linear-gradient(135deg, rgba(16, 185, 129, 0.04), transparent 70%), var(--bg-card);
+    }}
+
+    .stat-label {{
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      color: var(--color-ink-muted);
+      text-transform: uppercase;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }}
+
+    .stat-num {{
+      font-family: var(--font-serif);
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      font-variant-numeric: tabular-nums;
+      color: var(--color-ink);
+    }}
+
+    .stat-unit {{
+      font-size: 12px;
+      font-weight: 400;
+      color: var(--color-ink-muted);
+      margin-left: 2px;
+    }}
+
+    .stat-sub {{
+      font-size: 11px;
+      color: var(--color-ink-faint);
+    }}
+
+    /* ─── Institutional Panels ─── */
+    .panel {{
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: 6px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }}
+
+    .panel-head {{
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border-subtle);
+      background: rgba(255, 255, 255, 0.015);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }}
+
+    .panel-titles {{
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }}
+
+    .panel-title {{
+      font-family: var(--font-serif);
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--color-ink);
+    }}
+
+    .panel-meta {{
+      font-size: 11.5px;
+      color: var(--color-ink-muted);
+    }}
+
+    /* ─── Chart Specific Controls & Layout ─── */
+    .chart-controls {{
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }}
+
+    .chart-tab {{
+      padding: 4px 10px;
+      border-radius: 4px;
+      border: 1px solid var(--border-subtle);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--color-ink-muted);
+      font-family: var(--font-serif);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }}
+
+    .chart-tab:hover {{
+      color: var(--color-ink);
+      border-color: var(--border-focus);
+    }}
+
+    .chart-tab.active {{
+      color: var(--color-ink);
+      background: var(--bg-elevated);
+      border-color: var(--color-accent);
+      box-shadow: 0 0 10px rgba(56, 189, 248, 0.2);
+    }}
+
+    .chart-canvas-wrap {{
+      position: relative;
+      width: 100%;
+      height: 240px;
+      background: #090b10;
+      overflow: hidden;
+    }}
+
+    #equity-svg {{
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: crosshair;
+    }}
+
+    .chart-tooltip {{
+      position: absolute;
+      top: 14px;
+      left: 20px;
+      background: rgba(12, 14, 20, 0.92);
+      border: 1px solid var(--border-focus);
+      border-radius: 4px;
+      padding: 8px 12px;
+      pointer-events: none;
+      font-family: var(--font-serif);
+      font-size: 11.5px;
+      line-height: 1.4;
+      color: var(--color-ink);
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+      z-index: 10;
+      white-space: nowrap;
+    }}
+
+    .chart-metrics-bar {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      background: rgba(255, 255, 255, 0.015);
+      border-top: 1px solid var(--border-subtle);
+      padding: 10px 20px;
+      gap: 16px;
+    }}
+
+    .chart-metric {{
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }}
+
+    .chart-metric-label {{
+      font-size: 10.5px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--color-ink-muted);
+    }}
+
+    .chart-metric-val {{
+      font-family: var(--font-serif);
+      font-size: 13.5px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--color-ink);
+    }}
+
+    /* ─── Table Design ─── */
+    .table-wrap {{
+      width: 100%;
+      overflow-x: auto;
+    }}
+
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 13px;
+    }}
+
+    thead th {{
+      padding: 10px 16px;
+      font-family: var(--font-serif);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--color-ink-muted);
+      border-bottom: 1px solid var(--border-subtle);
+      background: rgba(255, 255, 255, 0.02);
+      white-space: nowrap;
+    }}
+
+    tbody td {{
+      padding: 11px 16px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+      font-family: var(--font-serif);
+      font-variant-numeric: tabular-nums;
+      color: var(--color-ink);
+      white-space: nowrap;
+      transition: background 0.1s ease;
+    }}
+
+    tbody tr:hover td {{
+      background: rgba(255, 255, 255, 0.025);
+    }}
+
+    tbody tr.total-row td {{
+      background: rgba(56, 189, 248, 0.04);
+      font-weight: 700;
+      border-top: 1px solid rgba(56, 189, 248, 0.2);
+    }}
+
+    /* Crypto Coin Icon Badge */
+    .coin-badge {{
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      font-weight: 600;
+    }}
+
     .coin-icon {{
-      position: relative; display: inline-grid; place-items: center;
-      flex: 0 0 20px; width: 20px; height: 20px;
-      color: var(--accent); border: 1px solid #12383d; background: #02090a;
-      font: 400 15px/1 'VT323', monospace; text-shadow: 0 0 5px var(--accent);
+      width: 18px;
+      height: 18px;
+      min-width: 18px;
+      min-height: 18px;
+      max-width: 18px;
+      max-height: 18px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.08);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 9.5px;
+      font-weight: 700;
+      color: var(--color-gold);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      overflow: hidden;
+      position: relative;
+      vertical-align: middle;
+      flex-shrink: 0;
     }}
+
     .coin-icon img {{
-      position: absolute; inset: 2px; width: 14px; height: 14px;
+      width: 13px;
+      height: 13px;
+      max-width: 13px;
+      max-height: 13px;
       object-fit: contain;
-      filter: brightness(0) saturate(100%) invert(83%) sepia(84%) saturate(2277%) hue-rotate(132deg) brightness(96%) contrast(105%);
+      display: block;
     }}
-    .coin-fallback {{ color: var(--accent); }}
-    .coin-symbol {{ line-height: 20px; }}
-    .total-icon {{ font-size: 17px; }}
-    .hint {{ color: var(--muted); font-size: 16px; }}
-    .field-grid {{ gap: 10px; }}
-    .field span {{ color: var(--muted); font-size: 14px; font-weight: 400; margin-bottom: 0; letter-spacing: 0.08em; }}
-    .field input, .field select, td input {{
-      min-height: auto; background: #000; color: var(--text); border-radius: 0;
-      font: 400 20px/1.2 'VT323', monospace; padding: 5px 9px;
+
+    .pos {{
+      color: var(--color-pos);
     }}
-    td input {{ min-height: auto; }}
-    button, .save {{
-      min-height: auto; background: #000; color: var(--accent); border-radius: 0;
-      font: 400 20px/1.2 'VT323', monospace; padding: 7px 15px;
+
+    .neg {{
+      color: var(--color-neg);
     }}
-    button:hover, .save:hover {{ background: #041418; }}
-    .save-bar {{ border-radius: 0; padding: 0; border: 0; background: transparent; }}
+
+    .zero {{
+      color: var(--color-ink-muted);
+    }}
+
+    /* ─── Log Viewer ─── */
+    .log-toolbar {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 16px;
+      background: rgba(255, 255, 255, 0.02);
+      border-bottom: 1px solid var(--border-subtle);
+    }}
+
+    .log-filter-input {{
+      background: rgba(0, 0, 0, 0.35);
+      border: 1px solid var(--border-subtle);
+      border-radius: 4px;
+      padding: 5px 12px;
+      font-family: var(--font-serif);
+      font-size: 12px;
+      color: var(--color-ink);
+      width: 260px;
+      outline: none;
+      transition: border-color 0.15s ease;
+    }}
+
+    .log-filter-input:focus {{
+      border-color: var(--color-accent);
+    }}
+
+    .log-tool-btn {{
+      padding: 4px 10px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border-subtle);
+      border-radius: 4px;
+      color: var(--color-ink-muted);
+      font-family: var(--font-serif);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }}
+
+    .log-tool-btn:hover {{
+      color: var(--color-ink);
+      border-color: var(--border-focus);
+    }}
+
+    .log-tool-btn.active {{
+      color: var(--color-pos);
+      border-color: rgba(16, 185, 129, 0.4);
+      background: var(--color-pos-bg);
+    }}
+
     .log-box {{
-      background: #000; border: 1px solid #1a1a1a; padding: 10px;
-      font: 400 15px/1.6 'VT323', monospace;
+      height: 480px;
+      overflow-y: auto;
+      padding: 14px 16px;
+      background: #050608;
+      font-family: "JetBrains Mono", "Courier New", monospace;
+      font-size: 11.5px;
+      line-height: 1.6;
+      color: #cbd5e1;
     }}
-    .log-line {{ color: #3a3a3a; }}
-    .log-warn {{ color: var(--warn); text-shadow: 0 0 4px var(--warn); }}
-    footer {{
-      max-width: none; text-align: center; padding: 10px;
-      color: var(--muted); font: 400 14px/1.4 'VT323', monospace;
-      border-top: 1px solid var(--border); letter-spacing: 0.04em;
+
+    .log-line {{
+      white-space: pre-wrap;
+      word-break: break-all;
     }}
-    @keyframes blink {{ 50% {{ opacity: 0; }} }}
-    .cursor {{ animation: blink 1s step-end infinite; color: var(--accent); }}
-    ::-webkit-scrollbar {{ width: 4px; height: 4px; background: #000; }}
-    ::-webkit-scrollbar-thumb {{ background: #222; border: 0; border-radius: 0; }}
-    @media (max-width: 1320px) {{
-      .info-bar {{ grid-template-columns: repeat(4, minmax(150px, 1fr)); }}
+
+    .log-line.log-warn {{
+      color: #f59e0b;
     }}
-    @media (max-width: 760px) {{
-      header {{ padding: 10px 16px; }}
-      header h1 {{ font-size: 26px; }}
-      .nav {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }}
-      .nav a {{ min-width: 0; text-align: center; padding: 4px 8px; }}
-      .header-tools .refresh-info {{ grid-column: 1 / -1; margin: 0 0 2px; }}
-      .container {{ padding: 14px 16px; }}
-      .info-bar {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-      .info-card {{ padding: 14px 16px; }}
-      .info-card .value {{ font-size: 26px; }}
-      th, td {{ padding-left: 10px; padding-right: 10px; }}
+
+    /* ─── Modal Dialog ─── */
+    .modal-backdrop {{
+      position: fixed;
+      inset: 0;
+      z-index: 200;
+      background: rgba(0, 0, 0, 0.75);
+      backdrop-filter: blur(8px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
     }}
-    @media (max-width: 430px) {{
-      .info-bar {{ grid-template-columns: 1fr; }}
+
+    .modal-card {{
+      background: var(--bg-surface);
+      border: 1px solid var(--border-focus);
+      border-radius: 8px;
+      width: 100%;
+      max-width: 460px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
+    }}
+
+    .modal-header {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }}
+
+    .modal-close-x {{
+      background: transparent;
+      border: none;
+      color: var(--color-ink-muted);
+      font-size: 20px;
+      cursor: pointer;
+    }}
+
+    .input-unit-group {{
+      display: flex;
+      align-items: center;
+      background: rgba(0, 0, 0, 0.4);
+      border: 1px solid var(--border-subtle);
+      border-radius: 4px;
+      padding: 2px 10px;
+    }}
+
+    .input-unit-group input {{
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: var(--color-ink);
+      font-family: var(--font-serif);
+      font-size: 14px;
+      padding: 8px 0;
+      outline: none;
+    }}
+
+    .unit-tag {{
+      font-size: 12px;
+      color: var(--color-ink-muted);
+    }}
+
+    /* Config Page Embedded Styles */
+    .strategy-meta-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }}
+
+    .meta-box {{
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--border-subtle);
+      border-radius: 4px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }}
+
+    .meta-box-label {{
+      font-size: 10.5px;
+      color: var(--color-ink-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }}
+
+    .meta-box-val {{
+      font-size: 13.5px;
+      font-weight: 700;
+      color: var(--color-ink);
+    }}
+
+    .field-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 12px;
+    }}
+
+    .field-card {{
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--border-subtle);
+      border-radius: 4px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }}
+
+    .field-label {{
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--color-ink-muted);
+      text-transform: uppercase;
+    }}
+
+    .tbl-input {{
+      background: rgba(0, 0, 0, 0.4);
+      border: 1px solid var(--border-subtle);
+      border-radius: 4px;
+      padding: 6px 10px;
+      color: var(--color-ink);
+      font-family: var(--font-serif);
+      font-size: 13px;
+      outline: none;
+      width: 100%;
+    }}
+
+    .tbl-input:focus {{
+      border-color: var(--color-accent);
+    }}
+
+    .sticky-actions-bar {{
+      position: sticky;
+      bottom: 20px;
+      margin-top: 10px;
+      padding: 12px 20px;
+      background: rgba(12, 14, 20, 0.95);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border-focus);
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+    }}
+
+    /* ─── Site Footer ─── */
+    .site-footer {{
+      margin-top: auto;
+      border-top: 1px solid var(--border-subtle);
+      background: rgba(6, 7, 9, 0.9);
+      padding: 12px 24px;
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      color: var(--color-ink-faint);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }}
+
+    @media (max-width: 900px) {{
+      .stat-ribbon {{
+        grid-template-columns: repeat(2, 1fr);
+      }}
+      .site-header {{
+        height: auto;
+        padding: 10px 16px;
+        flex-direction: column;
+        align-items: stretch;
+      }}
+      .tab-strip {{
+        overflow-x: auto;
+      }}
     }}
   </style>
   <script>
     (function() {{
-      var POLL_MS = 3000;
-      var PAGE = "{page}";
-      var last = {{}};
-      var meta = {{ updatedAt: 0, uptimeS: 0, fetchedAt: Date.now() }};
+      var POLL_MS = 2000;
+      var MARKETS_POLL_MS = 4000;
+      var chartMode = 'bot'; // 'bot' | 'assets' | 'dual'
+      var lastHistory = [];
+      var autoScroll = true;
+      var lastSnapshotAt = {view.get("updated_at", 0)};
 
       function $(id) {{ return document.getElementById(id); }}
-      function pad(n) {{ return String(n).padStart(2, '0'); }}
-      function fmtClock(d) {{
-        return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
-      }}
-      function fmtUptime(s) {{
-        s = Math.max(0, Math.floor(s));
-        return pad(Math.floor(s / 3600)) + 'h ' + pad(Math.floor((s % 3600) / 60)) + 'm ' + pad(s % 60) + 's';
-      }}
-      function fmtAge(age) {{
-        if (age == null || isNaN(age)) return 'no snapshot';
-        if (age < 60) return Math.floor(age) + 's ago';
-        return (age / 60).toFixed(1) + 'm ago';
-      }}
-      function setHtml(id, html) {{
-        if (last[id] === html) return false;
-        last[id] = html;
-        var el = $(id);
-        if (el) el.innerHTML = html;
-        return true;
-      }}
-      function setText(id, text) {{
-        var el = $(id);
-        if (el && el.textContent !== text) el.textContent = text;
-      }}
-      function setClass(id, cls) {{
-        var el = $(id);
-        if (el) el.className = cls;
-      }}
-      function tickClock() {{
-        var now = Date.now();
-        setText('clock', fmtClock(new Date(now)));
-        if (!meta.updatedAt) return;
-        var age = (now / 1000) - meta.updatedAt;
-        var liveUptime = meta.uptimeS + (now - meta.fetchedAt) / 1000;
-        setText('uptime', fmtUptime(liveUptime));
-        setText('snapshot-age', fmtAge(age));
-        var stale = age > {STALE_AFTER_S};
-        setClass('snapshot-age', stale ? 'value neg' : 'value');
-      }}
-      function apply(data) {{
-        if (data.error) {{
-          var box = $('app');
-          if (box) box.innerHTML = '<div class="card error">⚠️ 无法读取状态文件: ' + data.error + '</div>';
-          last = {{}};
-          return;
+
+      function updateSnapshotAge() {{
+        var el = $('snapshot-age');
+        if (!el || !lastSnapshotAt || lastSnapshotAt <= 0) return;
+        var age = Math.max(0, Math.floor(Date.now() / 1000 - lastSnapshotAt));
+        el.textContent = age < 60 ? (age + 's ago') : ((age / 60).toFixed(1) + 'm ago');
+        if (age > 15) {{
+          el.className = 'snapshot-age-tag neg';
+        }} else {{
+          el.className = 'snapshot-age-tag';
         }}
-        if (PAGE === 'config') return;
-        if (PAGE === 'markets') {{
-          setText('markets-meta', data.markets_meta || '');
-          setHtml('markets-body', data.markets_html);
-          tickClock();
-          return;
+      }}
+
+      window.switchTab = function(tabName) {{
+        var tabs = document.querySelectorAll('.tab-btn');
+        var panes = document.querySelectorAll('.tab-pane');
+        tabs.forEach(function(b) {{ b.classList.toggle('active', b.getAttribute('data-tab') === tabName); }});
+        panes.forEach(function(p) {{ p.classList.toggle('active', p.id === 'tab-' + tabName); }});
+        try {{
+          window.location.hash = '#' + tabName;
+          localStorage.setItem('okx_active_tab', tabName);
+        }} catch(e) {{}}
+        if (tabName === 'overview') {{
+          renderChart(lastHistory, chartMode);
+        }} else if (tabName === 'markets') {{
+          pollMarkets();
         }}
-        meta.updatedAt = data.updated_at || 0;
-        meta.uptimeS = data.uptime_s || 0;
-        meta.fetchedAt = Date.now();
-        setHtml('status-badge', data.status_html);
-        setText('strategy', data.strategy);
-        setText('usdt-bal', data.usdt_bal);
-        setHtml('global-pnl', data.global_pnl_html);
-        setClass('global-pnl', 'value ' + (data.global_pnl_cls || ''));
-        setText('realized', data.realized_html);
-        setClass('realized', data.realized_cls || '');
-        setText('unrealized', data.unrealized_html);
-        setClass('unrealized', data.unrealized_cls || '');
-        setHtml('snapshot-badge', data.snapshot_badge_html);
-        setHtml('stale-banner', data.stale_html || '');
-        setHtml('perf-body', data.perf_html);
-        setHtml('pos-body', data.pos_html);
-        setText('manual-close-note', data.manual_close_note || '');
-        setHtml('ord-body', data.ord_html);
-        setHtml('exec-body', data.exec_html);
+      }};
+
+      window.setChartMode = function(mode) {{
+        chartMode = mode;
+        document.querySelectorAll('.chart-tab').forEach(function(btn) {{
+          btn.classList.toggle('active', btn.getAttribute('data-mode') === mode);
+        }});
+        renderChart(lastHistory, chartMode);
+      }};
+
+      window.toggleAutoScroll = function() {{
+        autoScroll = !autoScroll;
+        var btn = $('autoscroll-btn');
+        if (btn) {{
+          btn.classList.toggle('active', autoScroll);
+          btn.textContent = 'AUTO-SCROLL: ' + (autoScroll ? 'ON' : 'OFF');
+        }}
+      }};
+
+      window.filterLogs = function(query) {{
+        query = (query || '').toLowerCase();
+        var lines = document.querySelectorAll('#logbox .log-line');
+        lines.forEach(function(line) {{
+          var txt = line.textContent.toLowerCase();
+          line.style.display = (!query || txt.indexOf(query) !== -1) ? 'block' : 'none';
+        }});
+      }};
+
+      window.clearLogs = function() {{
         var lb = $('logbox');
-        if (lb && last['logbox'] !== data.log_html) {{
-          var atBottom = lb.scrollHeight - lb.scrollTop - lb.clientHeight < 24;
-          lb.innerHTML = data.log_html;
-          last['logbox'] = data.log_html;
-          if (atBottom) lb.scrollTop = lb.scrollHeight;
+        if (lb) lb.innerHTML = '<div class="log-line zero">[Display Cleared by User]</div>';
+      }};
+
+      window.copyLogs = function() {{
+        var lb = $('logbox');
+        if (lb) {{
+          navigator.clipboard.writeText(lb.textContent || '').then(function() {{
+            alert('Logs copied to clipboard.');
+          }});
         }}
-        tickClock();
+      }};
+
+      function renderChart(history, mode) {{
+        if (!history || history.length < 2) return;
+        var svg = $('equity-svg');
+        if (!svg) return;
+        var width = 1000;
+        var height = 240;
+        var padTop = 30;
+        var padBottom = 30;
+        var plotH = height - padTop - padBottom;
+
+        // Stats tracking
+        var botPnls = history.map(function(h) {{ return h.bot_pnl; }});
+        var assets = history.map(function(h) {{ return h.assets; }});
+        var curBot = botPnls[botPnls.length - 1];
+        var curAssets = assets[assets.length - 1];
+        var peakBot = Math.max.apply(null, botPnls);
+
+        if ($('chart-stat-bot')) $('chart-stat-bot').textContent = (curBot >= 0 ? '+' : '') + curBot.toFixed(4) + ' USDT';
+        if ($('chart-stat-peak')) $('chart-stat-peak').textContent = (peakBot >= 0 ? '+' : '') + peakBot.toFixed(4) + ' USDT';
+        if ($('chart-stat-assets')) $('chart-stat-assets').textContent = '$' + curAssets.toFixed(2) + ' USDT';
+        if ($('chart-stat-ticks')) $('chart-stat-ticks').textContent = history.length;
+
+        // Scaling calculations
+        var minVal, maxVal;
+        if (mode === 'bot') {{
+          minVal = Math.min.apply(null, botPnls);
+          maxVal = Math.max.apply(null, botPnls);
+          var spread = Math.max(Math.abs(minVal), Math.abs(maxVal), 0.1);
+          minVal = -spread * 1.15;
+          maxVal = spread * 1.15;
+        }} else if (mode === 'assets') {{
+          minVal = Math.min.apply(null, assets);
+          maxVal = Math.max.apply(null, assets);
+          if (minVal === maxVal) {{ minVal -= 1; maxVal += 1; }}
+          var padA = (maxVal - minVal) * 0.15;
+          minVal -= padA;
+          maxVal += padA;
+        }} else {{ // dual
+          minVal = Math.min.apply(null, botPnls);
+          maxVal = Math.max.apply(null, botPnls);
+          var sp = Math.max(Math.abs(minVal), Math.abs(maxVal), 0.1);
+          minVal = -sp * 1.15;
+          maxVal = sp * 1.15;
+        }}
+
+        function getX(i) {{
+          return (i / (history.length - 1)) * width;
+        }}
+        function getY(v, mn, mx) {{
+          return padTop + plotH - ((v - mn) / (mx - mn)) * plotH;
+        }}
+
+        // Zero line calculation
+        var zeroY = getY(0, minVal, maxVal);
+        var zLine = $('chart-zero-line');
+        if (zLine) {{
+          if (mode === 'assets') {{
+            zLine.style.display = 'none';
+          }} else {{
+            zLine.style.display = 'block';
+            zLine.setAttribute('y1', zeroY);
+            zLine.setAttribute('y2', zeroY);
+          }}
+        }}
+
+        // Build Paths
+        function buildPath(dataKey, mn, mx) {{
+          var pts = history.map(function(h, idx) {{
+            return [getX(idx), getY(h[dataKey], mn, mx)];
+          }});
+          var d = 'M ' + pts[0][0] + ' ' + pts[0][1];
+          for (var i = 1; i < pts.length; i++) {{
+            var prev = pts[i - 1];
+            var cur = pts[i];
+            var midX = (prev[0] + cur[0]) / 2;
+            d += ' C ' + midX + ' ' + prev[1] + ', ' + midX + ' ' + cur[1] + ', ' + cur[0] + ' ' + cur[1];
+          }}
+          return {{ line: d, pts: pts }};
+        }}
+
+        var botPath = buildPath('bot_pnl', minVal, maxVal);
+        var botArea = botPath.line + ' L ' + width + ' ' + zeroY + ' L 0 ' + zeroY + ' Z';
+        
+        var minAst = Math.min.apply(null, assets);
+        var maxAst = Math.max.apply(null, assets);
+        if (minAst === maxAst) {{ minAst -= 1; maxAst += 1; }}
+        var padAst = (maxAst - minAst) * 0.15;
+        minAst -= padAst; maxAst += padAst;
+        var astPath = buildPath('assets', minAst, maxAst);
+        var astArea = astPath.line + ' L ' + width + ' ' + height + ' L 0 ' + height + ' Z';
+
+        var pLine = $('chart-line');
+        var pArea = $('chart-area');
+        var pAstLine = $('chart-assets-line');
+
+        if (mode === 'bot') {{
+          pLine.setAttribute('d', botPath.line);
+          pLine.setAttribute('stroke', curBot >= 0 ? '#10b981' : '#f43f5e');
+          pArea.setAttribute('d', botArea);
+          pArea.setAttribute('fill', curBot >= 0 ? 'url(#pnlGradPos)' : 'url(#pnlGradNeg)');
+          pArea.style.display = 'block';
+          if (pAstLine) pAstLine.style.display = 'none';
+        }} else if (mode === 'assets') {{
+          pLine.setAttribute('d', astPath.line);
+          pLine.setAttribute('stroke', '#38bdf8');
+          pArea.setAttribute('d', astArea);
+          pArea.setAttribute('fill', 'url(#assetsGrad)');
+          pArea.style.display = 'block';
+          if (pAstLine) pAstLine.style.display = 'none';
+        }} else {{ // dual
+          pLine.setAttribute('d', botPath.line);
+          pLine.setAttribute('stroke', '#10b981');
+          pArea.style.display = 'none';
+          if (pAstLine) {{
+            pAstLine.setAttribute('d', astPath.line);
+            pAstLine.setAttribute('stroke', '#38bdf8');
+            pAstLine.style.display = 'block';
+          }}
+        }}
+
+        // Interactive mouse hover crosshair
+        svg.onmousemove = function(ev) {{
+          var rect = svg.getBoundingClientRect();
+          var mouseX = (ev.clientX - rect.left) / rect.width * width;
+          var idx = Math.round((mouseX / width) * (history.length - 1));
+          idx = Math.max(0, Math.min(history.length - 1, idx));
+          var item = history[idx];
+          var hX = getX(idx);
+          var hY = getY(item.bot_pnl, minVal, maxVal);
+
+          var ch = $('chart-crosshair');
+          var dot = $('chart-hover-dot');
+          var tt = $('chart-tooltip');
+
+          if (ch) {{
+            ch.setAttribute('x1', hX);
+            ch.setAttribute('x2', hX);
+            ch.style.display = 'block';
+          }}
+          if (dot) {{
+            dot.setAttribute('cx', hX);
+            dot.setAttribute('cy', hY);
+            dot.style.display = 'block';
+          }}
+          if (tt) {{
+            var timeStr = new Date(item.t * 1000).toLocaleTimeString();
+            tt.innerHTML = '<strong>' + timeStr + '</strong><br>' +
+              '本机挂单操作盈亏: <span style="color:' + (item.bot_pnl >= 0 ? '#10b981' : '#f43f5e') + '">' +
+              (item.bot_pnl >= 0 ? '+' : '') + item.bot_pnl.toFixed(4) + ' USDT</span><br>' +
+              '总账户资产: <span style="color:#38bdf8">$' + item.assets.toFixed(2) + ' USDT</span>';
+            tt.style.display = 'block';
+            var leftPct = (hX / width) * 100;
+            if (leftPct > 70) {{
+              tt.style.left = 'auto';
+              tt.style.right = (100 - leftPct + 2) + '%';
+            }} else {{
+              tt.style.right = 'auto';
+              tt.style.left = (leftPct + 2) + '%';
+            }}
+          }}
+        }};
+
+        svg.onmouseleave = function() {{
+          var ch = $('chart-crosshair');
+          var dot = $('chart-hover-dot');
+          var tt = $('chart-tooltip');
+          if (ch) ch.style.display = 'none';
+          if (dot) dot.style.display = 'none';
+          if (tt) tt.style.display = 'none';
+        }};
       }}
+
+      function patch(id, val) {{
+        var el = $(id);
+        if (el && val !== undefined && el.innerHTML !== val) {{
+          el.innerHTML = val;
+        }}
+      }}
+
       function poll() {{
-        if (PAGE === 'config') return;
-        var url = PAGE === 'markets' ? '/api/markets' : '/api/view';
-        fetch(url, {{ cache: 'no-store' }})
+        fetch('/api/view', {{ cache: 'no-store' }})
           .then(function(r) {{ return r.json(); }})
-          .then(apply)
-          .catch(function() {{}});
+          .then(function(data) {{
+            if (!data) return;
+            if (data.updated_at) {{
+              lastSnapshotAt = data.updated_at;
+              updateSnapshotAge();
+            }}
+            patch('status-badge', data.status_html);
+            patch('snapshot-badge', data.snapshot_badge_html);
+            patch('usdt-bal', data.usdt_bal);
+            patch('global-pnl', data.global_pnl_html);
+            var gp = $('global-pnl');
+            if (gp) gp.className = 'stat-num ' + (data.global_pnl_cls || '');
+            patch('realized', data.realized_html);
+            var rEl = $('realized');
+            if (rEl && data.realized_cls) rEl.className = data.realized_cls;
+            patch('unrealized', data.unrealized_html);
+            var uEl = $('unrealized');
+            if (uEl && data.unrealized_cls) uEl.className = data.unrealized_cls;
+            patch('uptime', data.uptime_str || data.uptime);
+            patch('stale-banner', data.stale_html || '');
+            patch('perf-body', data.perf_html);
+            patch('pos-body', data.pos_html);
+            patch('manual-close-note', data.manual_close_note || '');
+            patch('ord-body', data.ord_html);
+            patch('exec-body', data.exec_html);
+            patch('logbox', data.log_html);
+
+            if (autoScroll) {{
+              var lb = $('logbox');
+              if (lb) lb.scrollTop = lb.scrollHeight;
+            }}
+
+            if (data.history && data.history.length > 0) {{
+              lastHistory = data.history;
+              renderChart(lastHistory, chartMode);
+            }}
+          }})
+          .catch(function(err) {{}});
       }}
+
+      function pollMarkets() {{
+        fetch('/api/markets', {{ cache: 'no-store' }})
+          .then(function(r) {{ return r.json(); }})
+          .then(function(data) {{
+            if (!data) return;
+            patch('markets-body', data.markets_html);
+            patch('markets-meta', data.markets_meta);
+          }})
+          .catch(function(err) {{}});
+      }}
+
       window.restartStrategy = function() {{
-        if (!window.confirm('将重新启动实盘交易策略。现有仓位和交易所保护订单不会被主动撤销，确定继续吗？')) return;
+        if (!confirm('确认重新启动交易策略？重启后本机挂单盈亏将立即自动归零。')) return;
         var btn = $('restart-btn');
-        if (btn) {{ btn.disabled = true; btn.textContent = 'RESTARTING...'; }}
+        if (btn) btn.disabled = true;
         fetch('/api/restart', {{
           method: 'POST',
-          headers: {{'X-Requested-With': 'OKX-Dashboard'}}
+          headers: {{ 'X-Requested-With': 'OKX-Dashboard' }}
         }})
-          .then(function(r) {{ return r.json().then(function(data) {{ return {{ok: r.ok, data: data}}; }}); }})
-          .then(function(result) {{
-            window.alert(result.data.message || (result.ok ? '重新启动已开始。' : '重新启动失败。'));
-            if (result.ok && btn) {{
-              btn.textContent = 'RESTART STARTED';
-              window.setTimeout(function() {{
-                btn.disabled = false;
-                btn.textContent = 'RESTART BOT';
-              }}, 130000);
-            }} else if (btn) {{
-              btn.disabled = false;
-              btn.textContent = 'RESTART BOT';
-            }}
-          }})
-          .catch(function() {{
-            window.alert('无法发送重新启动请求。');
-            if (btn) {{ btn.disabled = false; btn.textContent = 'RESTART BOT'; }}
+          .then(function(r) {{ return r.json(); }})
+          .then(function(data) {{
+            alert(data.message || '重启指令已下发');
+            if (btn) btn.disabled = false;
+            poll();
+          }}).catch(function() {{
+            alert('重启请求发送异常');
+            if (btn) btn.disabled = false;
           }});
       }};
+
       window.stopStrategy = function() {{
-        if (!window.confirm('将停止实盘交易策略并关闭 Dashboard，确定继续吗？')) return;
-        var stopBtn = $('stop-btn');
-        var restartBtn = $('restart-btn');
-        if (stopBtn) {{ stopBtn.disabled = true; stopBtn.textContent = 'STOPPING...'; }}
-        if (restartBtn) restartBtn.disabled = true;
+        if (!confirm('确定要停止交易策略并撤回运行吗？')) return;
+        var btn = $('stop-btn');
+        if (btn) btn.disabled = true;
         fetch('/api/stop', {{
           method: 'POST',
-          headers: {{'X-Requested-With': 'OKX-Dashboard'}}
+          headers: {{ 'X-Requested-With': 'OKX-Dashboard' }}
         }})
-          .then(function(r) {{ return r.json().then(function(data) {{ return {{ok: r.ok, data: data}}; }}); }})
-          .then(function(result) {{
-            window.alert(result.data.message || (result.ok ? '停止命令已发送。' : '停止失败。'));
-            if (!result.ok) {{
-              if (stopBtn) {{ stopBtn.disabled = false; stopBtn.textContent = 'STOP BOT'; }}
-              if (restartBtn) restartBtn.disabled = false;
-            }}
-          }})
-          .catch(function() {{
-            window.alert('无法发送停止请求。');
-            if (stopBtn) {{ stopBtn.disabled = false; stopBtn.textContent = 'STOP BOT'; }}
-            if (restartBtn) restartBtn.disabled = false;
+          .then(function(r) {{ return r.json(); }})
+          .then(function(data) {{
+            alert(data.message || '停止指令已下发');
+            if (btn) btn.disabled = false;
+            poll();
+          }}).catch(function() {{
+            alert('停止请求发送异常');
+            if (btn) btn.disabled = false;
           }});
       }};
-      var pendingClose = null;
-      function closeDialog() {{
-        pendingClose = null;
-        var dialog = $('manual-close-dialog');
-        if (dialog) dialog.hidden = true;
-      }}
-      function submitManualClose(pnl) {{
-        if (!pendingClose) return;
-        var body = {{
-          pair: pendingClose.pair,
-          side: pendingClose.side,
-          amount: pendingClose.amount,
-          breakeven: pendingClose.breakeven,
-          pnl: pnl
-        }};
+
+      // Manual Close Helpers
+      var manualTarget = {{ pair: '', side: '', amount: 0, breakeven: 0 }};
+      window.openManualClose = function(pair, side, amount, breakeven) {{
+        manualTarget = {{ pair: pair, side: side, amount: amount, breakeven: breakeven }};
+        $('manual-close-title').textContent = '手工平仓盈亏录入: ' + pair + ' (' + side + ')';
+        $('manual-close-pnl').value = '0.00';
+        $('manual-close-dialog').hidden = false;
+      }};
+      window.closeDialog = function() {{
+        $('manual-close-dialog').hidden = true;
+      }};
+      window.saveManualClose = function(pnlVal) {{
+        var val = (pnlVal !== undefined) ? pnlVal : parseFloat($('manual-close-pnl').value || '0');
         fetch('/api/manual-close', {{
           method: 'POST',
           headers: {{
             'Content-Type': 'application/json',
             'X-Requested-With': 'OKX-Dashboard'
           }},
-          body: JSON.stringify(body)
-        }})
-          .then(function(r) {{ return r.json().then(function(data) {{ return {{ ok: r.ok, data: data }}; }}); }})
-          .then(function(result) {{
-            if (!result.ok) {{
-              window.alert((result.data && result.data.message) || '标记失败');
-              return;
-            }}
+          body: JSON.stringify({{
+            pair: manualTarget.pair,
+            side: manualTarget.side,
+            amount: manualTarget.amount,
+            breakeven: manualTarget.breakeven,
+            pnl: val
+          }})
+        }}).then(function(r) {{ return r.json(); }})
+          .then(function(data) {{
+            if (data && !data.ok && data.message) alert(data.message);
             closeDialog();
             poll();
+          }}).catch(function() {{
+            alert('手工平仓提交失败');
+            closeDialog();
+          }});
+      }};
+
+      window.requestPositionClose = function(controller) {{
+        if (!confirm('确认市价平掉 [' + controller + '] 当前仓位并撤销开仓挂单？')) return;
+        fetch('/api/close-position', {{
+          method: 'POST',
+          headers: {{
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'OKX-Dashboard'
+          }},
+          body: JSON.stringify({{ controller: controller }})
+        }})
+          .then(function(r) {{ return r.json(); }})
+          .then(function(data) {{
+            alert(data.message || '平仓指令已下发');
+            poll();
           }})
-          .catch(function() {{ window.alert('无法标记手动平仓。'); }});
-      }}
-      document.addEventListener('click', function(ev) {{
-        var btn = ev.target.closest('.manual-close');
-        if (!btn) return;
-        pendingClose = {{
-          pair: btn.getAttribute('data-pair') || '',
-          side: btn.getAttribute('data-side') || '',
-          amount: btn.getAttribute('data-amount') || '',
-          breakeven: btn.getAttribute('data-breakeven') || ''
-        }};
-        var title = $('manual-close-title');
-        if (title) title.textContent = pendingClose.pair + ' 已手动平仓，填写这笔开单的最终盈亏';
-        var input = $('manual-close-pnl');
-        if (input) input.value = '';
-        var dialog = $('manual-close-dialog');
-        if (dialog) {{
-          dialog.hidden = false;
-          if (input) input.focus();
-        }}
-      }});
-      document.addEventListener('click', function(ev) {{
-        if (ev.target && ev.target.id === 'manual-close-save') {{
-          var raw = (($('manual-close-pnl') || {{}}).value || '').trim();
-          if (!raw) {{
-            window.alert('请输入最终盈亏，或选择「不输入，记为 0」。');
-            return;
-          }}
-          var pnl = Number(raw);
-          if (!isFinite(pnl)) {{
-            window.alert('盈亏金额无效。');
-            return;
-          }}
-          submitManualClose(pnl);
-        }} else if (ev.target && ev.target.id === 'manual-close-zero') {{
-          submitManualClose(0);
-        }} else if (ev.target && ev.target.id === 'manual-close-cancel') {{
-          closeDialog();
-        }}
-      }});
+          .catch(function() {{ alert('平仓请求发送异常'); }});
+      }};
+
       window.addEventListener('load', function() {{
-        ['status-badge', 'snapshot-badge', 'stale-banner', 'markets-body', 'perf-body',
-         'pos-body', 'ord-body', 'exec-body', 'logbox'].forEach(function(id) {{
-          var el = $(id);
-          if (el) last[id] = el.innerHTML;
-        }});
-        var lb = $('logbox');
-        if (lb) lb.scrollTop = lb.scrollHeight;
+        var hashTab = (window.location.hash || '').replace('#', '');
+        var savedTab = '';
+        try {{ savedTab = localStorage.getItem('okx_active_tab') || ''; }} catch(e) {{}}
+        var init = hashTab || savedTab || '{active_tab}';
+        if (['overview', 'positions', 'markets', 'logs', 'config'].indexOf(init) !== -1) {{
+          switchTab(init);
+        }}
         poll();
         setInterval(poll, POLL_MS);
-        setInterval(tickClock, 1000);
+        setInterval(function() {{
+          var c = $('clock');
+          if (c) c.textContent = new Date().toLocaleTimeString();
+          updateSnapshotAge();
+        }}, 1000);
+
+        var mCancel = $('manual-close-cancel');
+        if (mCancel) mCancel.onclick = closeDialog;
+        var mZero = $('manual-close-zero');
+        if (mZero) mZero.onclick = function() {{ saveManualClose(0); }};
+        var mSave = $('manual-close-save');
+        if (mSave) mSave.onclick = function() {{ saveManualClose(); }};
+
+        document.addEventListener('click', function(e) {{
+          var target = e.target;
+          if (target && target.classList && target.classList.contains('close-position')) {{
+            var ctrl = target.getAttribute('data-controller');
+            if (ctrl) window.requestPositionClose(ctrl);
+          }}
+        }});
       }});
     }})();
   </script>
 </head>
 <body>
-  <header>
-    <div class="brand">
-      <h1><a href="/">&gt; OKX_QUANT // {heading}<span class="cursor">_</span></a></h1>
+  <!-- ─── Institutional Header ─── -->
+  <header class="site-header">
+    <div class="brand-section">
+      <svg class="brand-logo-svg" width="28" height="28" viewBox="0 0 32 32" fill="none">
+        <rect width="32" height="32" rx="6" fill="#0f131a" stroke="rgba(255,255,255,0.12)"/>
+        <path d="M16 6L26 16L16 26L6 16L16 6Z" stroke="#e2b714" stroke-width="1.6"/>
+        <circle cx="16" cy="16" r="3.2" fill="#38bdf8"/>
+        <path d="M16 3V6M16 26V29M3 16H6M26 16H29" stroke="rgba(226,183,20,0.6)" stroke-width="1.2"/>
+      </svg>
+      <div class="brand-titles">
+        <a href="/" class="brand-main">OKX QUANT TRADER</a>
+        <span class="brand-sub">5M MEAN REVERSION · PRO TERMINAL</span>
+      </div>
     </div>
-    <nav class="nav">
-      {nav_html}
+
+    <!-- ─── Tab Strip (No Emoji) ─── -->
+    <nav class="tab-strip" role="tablist">
+      <button type="button" class="tab-btn active" data-tab="overview" onclick="switchTab('overview')">
+        <svg class="tab-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        <span>OVERVIEW</span>
+      </button>
+      <button type="button" class="tab-btn" data-tab="positions" onclick="switchTab('positions')">
+        <svg class="tab-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+        <span>POSITIONS &amp; ORDERS</span>
+      </button>
+      <button type="button" class="tab-btn" data-tab="markets" onclick="switchTab('markets')">
+        <svg class="tab-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        <span>MARKETS</span>
+      </button>
+      <button type="button" class="tab-btn" data-tab="logs" onclick="switchTab('logs')">
+        <svg class="tab-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+        <span>LOGS</span>
+      </button>
+      <button type="button" class="tab-btn" data-tab="config" onclick="switchTab('config')">
+        <svg class="tab-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span>CONFIG</span>
+      </button>
     </nav>
-    <div class="header-tools">
-      <div class="refresh-info">LIVE PATCH &nbsp;|&nbsp; <span id="clock">{now_str}</span></div>
-      <button type="button" id="restart-btn" class="control-btn restart" onclick="restartStrategy()">RESTART BOT</button>
-      <button type="button" id="stop-btn" class="control-btn stop" onclick="stopStrategy()">STOP BOT</button>
+
+    <!-- ─── Controls ─── -->
+    <div class="top-status-group">
+      <span id="status-badge">{view["status_html"]}</span>
+      <span id="snapshot-badge">{view["snapshot_badge_html"]}</span>
+      <span id="snapshot-age" class="snapshot-age-tag {stale_cls}">{age_label}</span>
+      <span id="clock" class="clock-display">{now_str}</span>
+      <button type="button" id="restart-btn" class="btn btn-action-warn" onclick="restartStrategy()">RESTART</button>
+      <button type="button" id="stop-btn" class="btn btn-action-neg" onclick="stopStrategy()">STOP</button>
     </div>
   </header>
-  <div class="container" id="app">
-    {body}
-  </div>
-  <footer>{footer}</footer>
+
+  <!-- ─── Main Content ─── -->
+  <main class="container">
+    <div id="stale-banner">{view.get("stale_html", "")}</div>
+
+    <!-- ══════════════ TAB 1: OVERVIEW ══════════════ -->
+    <div class="tab-pane active" id="tab-overview">
+      <!-- 5-Column Metric Ribbon -->
+      <div class="stat-ribbon">
+        <div class="stat-card highlight">
+          <div class="stat-label">
+            <span>TOTAL ASSETS (总资产)</span>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent)" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/><path d="M12 6v2m0 8v2"/></svg>
+          </div>
+          <div class="stat-num" id="usdt-bal">${view["usdt_bal"]}<span class="stat-unit">USDT</span></div>
+          <div class="stat-sub">OKX 永续合约保证金总权益</div>
+        </div>
+
+        <div class="stat-card">
+          <div class="stat-label">
+            <span>GLOBAL PNL (总盈亏)</span>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
+          </div>
+          <div class="stat-num {view['global_pnl_cls']}" id="global-pnl">{view['global_pnl_html']}</div>
+          <div class="stat-sub">REALIZED + UNREALIZED 实时求和</div>
+        </div>
+
+        <div class="stat-card">
+          <div class="stat-label">
+            <span>REALIZED / UNREALIZED</span>
+            <span class="badge green">重启清零</span>
+          </div>
+          <div class="stat-num" style="font-size: 17px;">
+            <span id="realized" class="{view['realized_cls']}">{view['realized_html']}</span>
+            <span style="color: var(--color-ink-faint); margin: 0 4px;">/</span>
+            <span id="unrealized" class="{view['unrealized_cls']}">{view['unrealized_html']}</span>
+          </div>
+          <div class="stat-sub">已实现落袋 / 浮动未实现 (USDT)</div>
+        </div>
+
+        <div class="stat-card">
+          <div class="stat-label">
+            <span>ENGINE RUNTIME</span>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          </div>
+          <div class="stat-num" id="uptime">{fmt_uptime(view["uptime_s"])}</div>
+          <div class="stat-sub">{view["strategy"]}</div>
+        </div>
+      </div>
+
+      <!-- Real-time Trajectory Chart Panel -->
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-titles">
+            <h2 class="panel-title">PORTFOLIO ASSETS &amp; BOT OPERATION PERFORMANCE</h2>
+            <span class="panel-meta">可视化分别展示总资产和本机挂单盈亏 · 本机操作盈亏每次重启自动归零起算</span>
+          </div>
+          <div class="chart-controls">
+            <button type="button" class="chart-tab active" data-mode="bot" onclick="setChartMode('bot')">BOT OPERATION PNL (挂单盈亏)</button>
+            <button type="button" class="chart-tab" data-mode="assets" onclick="setChartMode('assets')">TOTAL ASSETS (总资产)</button>
+            <button type="button" class="chart-tab" data-mode="dual" onclick="setChartMode('dual')">DUAL VIEW (双轨对比)</button>
+          </div>
+        </div>
+        <div class="chart-canvas-wrap">
+          <svg id="equity-svg" viewBox="0 0 1000 240" preserveAspectRatio="none">
+            <defs>
+              <linearGradient id="pnlGradPos" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#10b981" stop-opacity="0.35"/>
+                <stop offset="100%" stop-color="#10b981" stop-opacity="0.00"/>
+              </linearGradient>
+              <linearGradient id="pnlGradNeg" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#f43f5e" stop-opacity="0.35"/>
+                <stop offset="100%" stop-color="#f43f5e" stop-opacity="0.00"/>
+              </linearGradient>
+              <linearGradient id="assetsGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.30"/>
+                <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.00"/>
+              </linearGradient>
+            </defs>
+            <path id="chart-area" d="" fill="url(#pnlGradPos)"/>
+            <path id="chart-line" d="" fill="none" stroke="#10b981" stroke-width="2.2"/>
+            <path id="chart-assets-line" d="" fill="none" stroke="#38bdf8" stroke-width="2.0" style="display:none;"/>
+            <line id="chart-zero-line" x1="0" y1="120" x2="1000" y2="120" stroke="rgba(255,255,255,0.18)" stroke-dasharray="3,3"/>
+            <line id="chart-crosshair" x1="0" y1="0" x2="0" y2="240" stroke="rgba(56,189,248,0.7)" stroke-width="1.2" stroke-dasharray="2,2" style="display:none;"/>
+            <circle id="chart-hover-dot" cx="0" cy="0" r="4.5" fill="#38bdf8" stroke="#ffffff" stroke-width="1.8" style="display:none;"/>
+          </svg>
+          <div id="chart-tooltip" class="chart-tooltip" style="display:none;"></div>
+        </div>
+        <div class="chart-metrics-bar">
+          <div class="chart-metric">
+            <span class="chart-metric-label">BOT SESSION RETURN (本次)</span>
+            <span class="chart-metric-val {view['bot_session_pnl_cls']}" id="chart-stat-bot">{view['bot_session_pnl_html']} USDT</span>
+          </div>
+          <div class="chart-metric">
+            <span class="chart-metric-label">SESSION PEAK GAIN</span>
+            <span class="chart-metric-val pos" id="chart-stat-peak">--</span>
+          </div>
+          <div class="chart-metric">
+            <span class="chart-metric-label">TOTAL ACCOUNT ASSETS</span>
+            <span class="chart-metric-val" id="chart-stat-assets">${view['usdt_bal']} USDT</span>
+          </div>
+          <div class="chart-metric">
+            <span class="chart-metric-label">RUNTIME DATA TICKS</span>
+            <span class="chart-metric-val" id="chart-stat-ticks">0</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Performance Summary Table -->
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-titles">
+            <h2 class="panel-title">STRATEGY CONTROLLER PERFORMANCE MATRIX</h2>
+            <span class="panel-meta">|Z| ≥ 2.0 偏离触发建仓 · 动态 ATR 止损与现金止盈 · 真实扣费结算</span>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>CONTROLLER</th><th>ACTION</th><th>Z-SCORE DEVIATION</th><th>REALIZED (USDT)</th><th>UNREALIZED (USDT)</th>
+              <th>GLOBAL PNL</th><th>RETURN%</th><th>VOLUME TRADED (USDT)</th>
+            </tr></thead>
+            <tbody id="perf-body">{view["perf_html"]}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════════ TAB 2: POSITIONS & ORDERS ══════════════ -->
+    <div class="tab-pane" id="tab-positions">
+      <!-- Active Positions -->
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-titles">
+            <h2 class="panel-title">ACTIVE MARGIN POSITIONS</h2>
+            <span class="panel-meta" id="manual-close-note">{html.escape(view.get("manual_close_note") or "")}</span>
+          </div>
+        </div>
+        
+        <!-- Manual Close Dialog -->
+        <div id="manual-close-dialog" class="modal-backdrop" hidden>
+          <div class="modal-card">
+            <div class="modal-header">
+              <h3 id="manual-close-title">MANUAL POSITION CLOSE SETTLEMENT</h3>
+              <button type="button" class="modal-close-x" onclick="document.getElementById('manual-close-dialog').hidden=true">&times;</button>
+            </div>
+            <div class="modal-body">
+              <p style="font-size: 12px; color: var(--color-ink-muted); margin-bottom: 12px;">
+                若已在 OKX 交易所手动市价平仓该仓位，请录入结算净盈亏金额，面板将自动同步并记入已实现盈亏统计。
+              </p>
+              <div class="input-unit-group">
+                <input id="manual-close-pnl" inputmode="decimal" autocomplete="off" placeholder="例如 1.25 或 -0.40">
+                <span class="unit-tag">USDT</span>
+              </div>
+            </div>
+            <div style="display:flex; justify-content:flex-end; gap:8px;">
+              <button type="button" id="manual-close-cancel" class="btn btn-secondary">CANCEL</button>
+              <button type="button" id="manual-close-zero" class="btn btn-subtle">MARK AS 0</button>
+              <button type="button" id="manual-close-save" class="btn btn-primary">CONFIRM PNL</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>TRADING PAIR</th><th>MANUAL RECORD</th><th>SIDE</th><th>AMOUNT</th><th>NOTIONAL VALUE</th>
+              <th>BREAKEVEN PRICE</th><th>UNREALIZED PNL</th><th>REALIZED PNL</th><th>FEES</th>
+            </tr></thead>
+            <tbody id="pos-body">{view["pos_html"]}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Active Open Orders -->
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-titles">
+            <h2 class="panel-title">OPEN LIMIT ORDERS</h2>
+            <span class="panel-meta">待成交限价入场或回归平仓订单</span>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>TRADING PAIR</th><th>SIDE</th><th>PRICE</th><th>AMOUNT</th><th>ORDER AGE</th>
+            </tr></thead>
+            <tbody id="ord-body">{view["ord_html"]}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Position Executors Lifecycle -->
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-titles">
+            <h2 class="panel-title">POSITION EXECUTORS MONITOR</h2>
+            <span class="panel-meta">入场、ATR 动态止损与收益锁定生命周期监控</span>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>CONTROLLER</th><th>SIDE</th><th>STATUS</th><th>NET PNL</th>
+              <th>PNL%</th><th>VOLUME</th><th>LIVE</th><th>CLOSE TYPE</th><th>EXECUTOR AGE</th>
+            </tr></thead>
+            <tbody id="exec-body">{view["exec_html"]}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════════ TAB 3: MARKETS ══════════════ -->
+    <div class="tab-pane" id="tab-markets">
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-titles">
+            <h2 class="panel-title">OKX PERPETUAL SWAP MARKET OVERVIEW</h2>
+            <span class="panel-meta" id="markets-meta">{markets_data["markets_meta"]}</span>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>TRADING PAIR</th><th>LAST PRICE</th><th>24H CHANGE</th><th>BID PRICE</th><th>ASK PRICE</th>
+              <th>SPREAD</th><th>24H HIGH</th><th>24H LOW</th><th>24H VOLUME (USDT)</th>
+            </tr></thead>
+            <tbody id="markets-body">{markets_data["markets_html"]}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════════ TAB 4: LOGS ══════════════ -->
+    <div class="tab-pane" id="tab-logs">
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-titles">
+            <h2 class="panel-title">PROCESS CONSOLE LOG STREAM</h2>
+            <span class="panel-meta">实时终端进程输出 (Latest 60 lines)</span>
+          </div>
+          <div class="log-toolbar" style="border:none; padding:0; background:transparent;">
+            <button type="button" id="autoscroll-btn" class="log-tool-btn active" onclick="toggleAutoScroll()">AUTO-SCROLL: ON</button>
+            <input id="log-filter" class="log-filter-input" placeholder="Filter log lines..." oninput="filterLogs(this.value)">
+            <button type="button" class="log-tool-btn" onclick="clearLogs()">CLEAR</button>
+            <button type="button" class="log-tool-btn" onclick="copyLogs()">COPY</button>
+          </div>
+        </div>
+        <div class="log-box" id="logbox">{view["log_html"]}</div>
+      </div>
+    </div>
+
+    <!-- ══════════════ TAB 5: CONFIG ══════════════ -->
+    <div class="tab-pane" id="tab-config">
+      {config_body}
+    </div>
+  </main>
+
+  <!-- ─── Institutional Footer ─── -->
+  <footer class="site-footer">
+    <span>OKX QUANTITATIVE TRADER // PRO INSTITUTIONAL TERMINAL · 5M MEAN REVERSION</span>
+    <span>STATUS: <span style="color:var(--color-pos)">ENGINE ONLINE</span> · LATENCY {age_label}</span>
+  </footer>
 </body>
 </html>"""
 
 
-# ─── HTTP 服务 ───────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # 静默日志
@@ -1829,13 +2842,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             path = self.path.split("?", 1)[0].rstrip("/") or "/"
-            if path in ("/api/status", "/api/view", "/api/markets", "/api/config"):
+            if path in ("/api/status", "/api/view", "/api/markets", "/api/config", "/api/presets"):
                 if path == "/api/config":
                     try:
                         data = config_view()
                     except ConfigError as exc:
                         self._send_json(400, {"ok": False, "message": str(exc)})
                         return
+                elif path == "/api/presets":
+                    data = get_presets_info()
                 else:
                     status = read_status()
                     if path == "/api/status":
@@ -1845,6 +2860,7 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         data = build_view(status)
                 self._send_json(200, data)
+
             elif path in ("/", "/index.html", "/markets", "/config"):
                 status = {} if path == "/config" else read_status()
                 page = {"/markets": "markets", "/config": "config"}.get(path, "dashboard")
@@ -1867,21 +2883,44 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path = self.path.split("?", 1)[0].rstrip("/") or "/"
             if path in ("/api/restart", "/api/stop"):
-                if self.client_address[0] not in ("127.0.0.1", "::1"):
+                if self.client_address[0] not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
                     self._send_json(403, {"ok": False, "message": "只允许从本机控制策略。"})
                     return
-                if self.headers.get("X-Requested-With") != "OKX-Dashboard":
+                if (self.headers.get("X-Requested-With") or "").strip().lower() != "okx-dashboard":
                     self._send_json(403, {"ok": False, "message": "请求校验失败。"})
                     return
                 control = restart_strategy if path == "/api/restart" else stop_strategy
                 started, message = control()
                 self._send_json(202 if started else 409, {"ok": started, "message": message})
                 return
+
+            if path == "/api/close-position":
+                if self.client_address[0] not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+                    self._send_json(403, {"ok": False, "message": "只允许从本机平仓。"})
+                    return
+                if (self.headers.get("X-Requested-With") or "").strip().lower() != "okx-dashboard":
+                    self._send_json(403, {"ok": False, "message": "请求校验失败。"})
+                    return
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                if length < 0 or length > 4_000:
+                    self._send_json(413, {"ok": False, "message": "请求过大"})
+                    return
+                try:
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    message = request_position_close(str(payload.get("controller") or ""))
+                except ValueError as exc:
+                    self._send_json(400, {"ok": False, "message": str(exc)})
+                    return
+                except json.JSONDecodeError:
+                    self._send_json(400, {"ok": False, "message": "请求不是 JSON"})
+                    return
+                self._send_json(200, {"ok": True, "message": message})
+                return
             if path == "/api/manual-close":
-                if self.client_address[0] not in ("127.0.0.1", "::1"):
+                if self.client_address[0] not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
                     self._send_json(403, {"ok": False, "message": "只允许从本机标记手动平仓。"})
                     return
-                if self.headers.get("X-Requested-With") != "OKX-Dashboard":
+                if (self.headers.get("X-Requested-With") or "").strip().lower() != "okx-dashboard":
                     self._send_json(403, {"ok": False, "message": "请求校验失败。"})
                     return
                 length = int(self.headers.get("Content-Length", "0") or "0")

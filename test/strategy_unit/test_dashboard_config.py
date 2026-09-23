@@ -17,6 +17,7 @@ trading_pair: BTC-USDT
 total_amount_quote: 180
 leverage: 3
 take_profit_quote: 0.75
+fixed_unrealized_tp_quote: 2
 candles_interval: 5m
 mean_window: 48
 entry_z_score: 2.0

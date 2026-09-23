@@ -21,6 +21,7 @@ round_trip_cost_pct: 0.0012
 min_net_edge_pct: 0.0018
 min_reward_risk: 1.0
 take_profit_quote: 0.3
+fixed_unrealized_tp_quote: 2
 quote_offset_pct: 0.0002
 max_bid_ask_spread_pct: 0.002
 executor_refresh_time: 60
