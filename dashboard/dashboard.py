@@ -1248,7 +1248,7 @@ def render_html(status: dict, page: str = "dashboard") -> str:
     .site-header {{
       position: sticky;
       top: 0;
-      z-index: 100;
+      z-index: 400;
       background: rgba(6, 7, 9, 0.88);
       backdrop-filter: blur(16px);
       -webkit-backdrop-filter: blur(16px);
@@ -1895,10 +1895,18 @@ def render_html(status: dict, page: str = "dashboard") -> str:
       z-index: 200;
       background: rgba(0, 0, 0, 0.75);
       backdrop-filter: blur(8px);
-      display: flex;
+      display: none;
       align-items: center;
       justify-content: center;
       padding: 20px;
+    }}
+
+    .modal-backdrop[hidden] {{
+      display: none !important;
+    }}
+
+    .modal-backdrop.is-open:not([hidden]) {{
+      display: flex;
     }}
 
     .modal-card {{
@@ -2091,6 +2099,7 @@ def render_html(status: dict, page: str = "dashboard") -> str:
       }}
 
       window.switchTab = function(tabName) {{
+        closeDialog();
         var tabs = document.querySelectorAll('.tab-btn');
         var panes = document.querySelectorAll('.tab-pane');
         tabs.forEach(function(b) {{ b.classList.toggle('active', b.getAttribute('data-tab') === tabName); }});
@@ -2419,14 +2428,21 @@ def render_html(status: dict, page: str = "dashboard") -> str:
 
       // Manual Close Helpers
       var manualTarget = {{ pair: '', side: '', amount: 0, breakeven: 0 }};
+      window.closeDialog = function() {{
+        var dialog = $('manual-close-dialog');
+        if (!dialog) return;
+        dialog.classList.remove('is-open');
+        dialog.hidden = true;
+      }};
       window.openManualClose = function(pair, side, amount, breakeven) {{
         manualTarget = {{ pair: pair, side: side, amount: amount, breakeven: breakeven }};
         $('manual-close-title').textContent = '手工平仓盈亏录入: ' + pair + ' (' + side + ')';
         $('manual-close-pnl').value = '0.00';
-        $('manual-close-dialog').hidden = false;
-      }};
-      window.closeDialog = function() {{
-        $('manual-close-dialog').hidden = true;
+        var dialog = $('manual-close-dialog');
+        dialog.hidden = false;
+        dialog.classList.add('is-open');
+        var input = $('manual-close-pnl');
+        if (input) input.focus();
       }};
       window.saveManualClose = function(pnlVal) {{
         var val = (pnlVal !== undefined) ? pnlVal : parseFloat($('manual-close-pnl').value || '0');
@@ -2494,11 +2510,32 @@ def render_html(status: dict, page: str = "dashboard") -> str:
         if (mZero) mZero.onclick = function() {{ saveManualClose(0); }};
         var mSave = $('manual-close-save');
         if (mSave) mSave.onclick = function() {{ saveManualClose(); }};
+        var mDialog = $('manual-close-dialog');
+        if (mDialog) {{
+          mDialog.addEventListener('click', function(e) {{
+            if (e.target === mDialog) closeDialog();
+          }});
+        }}
+        document.addEventListener('keydown', function(e) {{
+          if (e.key === 'Escape') closeDialog();
+        }});
 
         document.addEventListener('click', function(e) {{
           var target = e.target;
-          if (target && target.classList && target.classList.contains('close-position')) {{
-            var ctrl = target.getAttribute('data-controller');
+          if (!target || !target.closest) return;
+          var manual = target.closest('.manual-close');
+          if (manual) {{
+            window.openManualClose(
+              manual.getAttribute('data-pair'),
+              manual.getAttribute('data-side'),
+              parseFloat(manual.getAttribute('data-amount')),
+              parseFloat(manual.getAttribute('data-breakeven'))
+            );
+            return;
+          }}
+          var closeBtn = target.closest('.close-position');
+          if (closeBtn) {{
+            var ctrl = closeBtn.getAttribute('data-controller');
             if (ctrl) window.requestPositionClose(ctrl);
           }}
         }});
@@ -2700,7 +2737,7 @@ def render_html(status: dict, page: str = "dashboard") -> str:
           <div class="modal-card">
             <div class="modal-header">
               <h3 id="manual-close-title">MANUAL POSITION CLOSE SETTLEMENT</h3>
-              <button type="button" class="modal-close-x" onclick="document.getElementById('manual-close-dialog').hidden=true">&times;</button>
+              <button type="button" class="modal-close-x" onclick="closeDialog()" aria-label="关闭">&times;</button>
             </div>
             <div class="modal-body">
               <p style="font-size: 12px; color: var(--color-ink-muted); margin-bottom: 12px;">
