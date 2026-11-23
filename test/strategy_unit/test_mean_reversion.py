@@ -117,12 +117,14 @@ def test_parameter_validation(invalid):
 
 def test_live_price_spike_triggers_without_closed_confirmation():
     frame = candles(100.0)
+    # Default is double confirmation (require_closed_candle_confirmation=True)
     snapshot_default = calculate_snapshot(frame, NOW, D('97.5'), MeanReversionSettings())
-    assert snapshot_default.signal == 1
+    assert snapshot_default.signal == 0
     assert snapshot_default.closed_z == snapshot_default.closed_z_score
     assert snapshot_default.live_z == snapshot_default.z_score
 
-    snapshot_strict = calculate_snapshot(
-        frame, NOW, D('97.5'), MeanReversionSettings(require_closed_candle_confirmation=True)
+    # When disabled, live price spike triggers without closed confirmation
+    snapshot_live = calculate_snapshot(
+        frame, NOW, D('97.5'), MeanReversionSettings(require_closed_candle_confirmation=False)
     )
-    assert snapshot_strict.signal == 0
+    assert snapshot_live.signal == 1

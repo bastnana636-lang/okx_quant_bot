@@ -663,6 +663,58 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertIn("pos3", [p.id for p in positions_by_ids])
         self.assertNotIn("pos2", [p.id for p in positions_by_ids])
 
+    def test_delete_position_removes_matching_row(self):
+        recorder = MarketsRecorder(
+            sql=self.manager,
+            markets=[self],
+            config_file_path=self.config_file_path,
+            strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(
+                market_data_collection_enabled=False,
+                market_data_collection_interval=60,
+                market_data_collection_depth=20,
+            ),
+        )
+        recorder.store_position(Position(
+            id="ghost1",
+            timestamp=123,
+            controller_id="okx_pmm_sol",
+            connector_name="okx_perpetual",
+            trading_pair="SOL-USDT",
+            side=TradeType.SELL.name,
+            amount=Decimal("0.42"),
+            breakeven_price=Decimal("117"),
+            unrealized_pnl_quote=Decimal("-2.5"),
+            realized_pnl_quote=Decimal("0"),
+            cum_fees_quote=Decimal("0.01"),
+            volume_traded_quote=Decimal("49"),
+        ))
+        recorder.store_position(Position(
+            id="keep1",
+            timestamp=124,
+            controller_id="okx_pmm_eth",
+            connector_name="okx_perpetual",
+            trading_pair="ETH-USDT",
+            side=TradeType.BUY.name,
+            amount=Decimal("0.01"),
+            breakeven_price=Decimal("3000"),
+            unrealized_pnl_quote=Decimal("0"),
+            realized_pnl_quote=Decimal("0"),
+            cum_fees_quote=Decimal("0"),
+            volume_traded_quote=Decimal("30"),
+        ))
+
+        deleted = recorder.delete_position(
+            controller_id="okx_pmm_sol",
+            connector_name="okx_perpetual",
+            trading_pair="SOL-USDT",
+            side=TradeType.SELL.name,
+        )
+
+        self.assertEqual(1, deleted)
+        remaining = recorder.get_all_positions()
+        self.assertEqual(["keep1"], [row.id for row in remaining])
+
     def test_store_or_update_executor(self):
         recorder = MarketsRecorder(
             sql=self.manager,

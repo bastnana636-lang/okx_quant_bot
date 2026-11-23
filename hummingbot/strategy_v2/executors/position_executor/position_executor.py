@@ -63,6 +63,8 @@ class PositionExecutor(ExecutorBase):
         self._failed_orders: List[TrackedOrder] = []
         self._trailing_stop_trigger_pct: Optional[Decimal] = None
 
+        self._cum_open_filled_amount: Decimal = Decimal("0")
+        self._cum_close_filled_amount: Decimal = Decimal("0")
         self._total_executed_amount_backup: Decimal = Decimal("0")
 
     @property
@@ -90,16 +92,16 @@ class PositionExecutor(ExecutorBase):
 
         :return: The filled amount of the open order if it exists, otherwise 0.
         """
+        amount = getattr(self, "_cum_open_filled_amount", Decimal("0"))
         if self._open_order:
             if self._open_order.fee_asset == self.config.trading_pair.split("-")[0]:
                 open_filled_amount = self._open_order.executed_amount_base - self._open_order.cum_fees_base
             else:
                 open_filled_amount = self._open_order.executed_amount_base
-            return self.connectors[self.config.connector_name].quantize_order_amount(
-                trading_pair=self.config.trading_pair,
-                amount=open_filled_amount)
-        else:
-            return Decimal("0")
+            amount += open_filled_amount
+        return self.connectors[self.config.connector_name].quantize_order_amount(
+            trading_pair=self.config.trading_pair,
+            amount=amount)
 
     @property
     def amount_to_close(self) -> Decimal:
@@ -126,7 +128,10 @@ class PositionExecutor(ExecutorBase):
 
         :return: The filled amount of the close order if it exists, otherwise 0.
         """
-        return self._close_order.executed_amount_base if self._close_order else Decimal("0")
+        amount = getattr(self, "_cum_close_filled_amount", Decimal("0"))
+        if self._close_order:
+            amount += self._close_order.executed_amount_base
+        return amount
 
     @property
     def close_filled_amount_quote(self) -> Decimal:
@@ -269,7 +274,15 @@ class PositionExecutor(ExecutorBase):
         orders = [self._open_order, self._close_order]
         if self._take_profit_limit_order and self._take_profit_limit_order != self._close_order:
             orders.append(self._take_profit_limit_order)
-        return sum([order.cum_fees_quote for order in orders if order])
+        if hasattr(self, "_failed_orders") and self._failed_orders:
+            orders.extend(self._failed_orders)
+        seen_order_ids = set()
+        total_fees = Decimal("0")
+        for order in orders:
+            if order and order.order_id not in seen_order_ids:
+                seen_order_ids.add(order.order_id)
+                total_fees += order.cum_fees_quote
+        return total_fees
 
     def get_net_pnl_pct(self) -> Decimal:
         """
@@ -297,19 +310,39 @@ class PositionExecutor(ExecutorBase):
 
         :return: The take profit price.
         """
-        if self.config.side == TradeType.BUY:
-            take_profit_price = self.entry_price * (1 + self.config.triple_barrier_config.take_profit)
-            if self.config.triple_barrier_config.take_profit_order_type == OrderType.LIMIT_MAKER:
-                take_profit_price = max(take_profit_price,
+        quote_target = self.config.triple_barrier_config.take_profit_quote
+        quote_tp_price = None
+        if quote_target is not None and self.open_filled_amount > 0:
+            if self.config.side == TradeType.BUY:
+                quote_tp_price = self.entry_price + (quote_target / self.open_filled_amount)
+            else:
+                quote_tp_price = self.entry_price - (quote_target / self.open_filled_amount)
+
+        mean_tp_price = None
+        if self.config.triple_barrier_config.take_profit:
+            if self.config.side == TradeType.BUY:
+                mean_tp_price = self.entry_price * (1 + self.config.triple_barrier_config.take_profit)
+                if self.config.triple_barrier_config.take_profit_order_type == OrderType.LIMIT_MAKER:
+                    mean_tp_price = max(mean_tp_price,
                                         self.get_price(self.config.connector_name, self.config.trading_pair,
                                                        PriceType.BestAsk))
-        else:
-            take_profit_price = self.entry_price * (1 - self.config.triple_barrier_config.take_profit)
-            if self.config.triple_barrier_config.take_profit_order_type == OrderType.LIMIT_MAKER:
-                take_profit_price = min(take_profit_price,
+            else:
+                mean_tp_price = self.entry_price * (1 - self.config.triple_barrier_config.take_profit)
+                if self.config.triple_barrier_config.take_profit_order_type == OrderType.LIMIT_MAKER:
+                    mean_tp_price = min(mean_tp_price,
                                         self.get_price(self.config.connector_name, self.config.trading_pair,
                                                        PriceType.BestBid))
-        return take_profit_price
+
+        if quote_tp_price is not None and mean_tp_price is not None:
+            if self.config.side == TradeType.BUY:
+                return min(quote_tp_price, mean_tp_price)
+            else:
+                return max(quote_tp_price, mean_tp_price)
+        elif quote_tp_price is not None:
+            return quote_tp_price
+        elif mean_tp_price is not None:
+            return mean_tp_price
+        return self.entry_price
 
     async def control_task(self):
         """
@@ -385,7 +418,23 @@ class PositionExecutor(ExecutorBase):
                 self._failed_orders.append(self._close_order)
                 self._close_order = None
         else:
-            self.place_close_order_and_cancel_open_orders(close_type=self.close_type)
+            price = Decimal("NaN")
+            quote_target = self.config.triple_barrier_config.take_profit_quote
+            if self.close_type in (CloseType.TAKE_PROFIT, CloseType.EARLY_STOP) and self.open_filled_amount > 0:
+                target = quote_target
+                if target is None and self.config.triple_barrier_config.take_profit:
+                    target = self.config.triple_barrier_config.take_profit * self.open_filled_amount_quote
+                if target is not None and target > 0:
+                    if self.config.side == TradeType.BUY:
+                        raw_price = self.entry_price + (target / self.open_filled_amount)
+                    else:
+                        raw_price = self.entry_price - (target / self.open_filled_amount)
+                    try:
+                        price = self.connectors[self.config.connector_name].quantize_order_price(
+                            self.config.trading_pair, raw_price)
+                    except Exception:
+                        price = raw_price
+            self.place_close_order_and_cancel_open_orders(close_type=self.close_type, price=price)
 
     async def on_start(self):
         """
@@ -474,18 +523,36 @@ class PositionExecutor(ExecutorBase):
         quote_target = self.config.triple_barrier_config.take_profit_quote
         if (quote_target is not None and self.open_filled_amount > 0
                 and self.trade_pnl_quote >= quote_target):
-            self.place_close_order_and_cancel_open_orders(close_type=CloseType.TAKE_PROFIT)
+            if self.config.side == TradeType.BUY:
+                raw_price = self.entry_price + (quote_target / self.open_filled_amount)
+            else:
+                raw_price = self.entry_price - (quote_target / self.open_filled_amount)
+            try:
+                target_price = self.connectors[self.config.connector_name].quantize_order_price(
+                    self.config.trading_pair, raw_price)
+            except Exception:
+                target_price = raw_price
+            self.place_close_order_and_cancel_open_orders(close_type=CloseType.TAKE_PROFIT, price=target_price)
             return
-        if self._open_order and self._open_order.is_filled and self.open_filled_amount >= self.trading_rules.min_order_size \
-                and self.open_filled_amount_quote >= self.trading_rules.min_notional_size:
+        has_min_size = True
+        trading_rules = getattr(self, "trading_rules", None)
+        if trading_rules:
+            min_size = getattr(trading_rules, "min_order_size", Decimal("0"))
+            min_notional = getattr(trading_rules, "min_notional_size", Decimal("0"))
+            if isinstance(min_size, Decimal) and self.open_filled_amount < min_size:
+                has_min_size = False
+            if isinstance(min_notional, Decimal) and self.open_filled_amount_quote < min_notional:
+                has_min_size = False
+
+        if has_min_size and self.open_filled_amount > Decimal("0"):
             self.control_stop_loss()
-            if self.status != RunnableStatus.RUNNING:
+            if getattr(self, "status", None) in (RunnableStatus.SHUTTING_DOWN, RunnableStatus.TERMINATED):
                 return
             self.control_trailing_stop()
-            if self.status != RunnableStatus.RUNNING:
+            if getattr(self, "status", None) in (RunnableStatus.SHUTTING_DOWN, RunnableStatus.TERMINATED):
                 return
             self.control_take_profit()
-            if self.status != RunnableStatus.RUNNING:
+            if getattr(self, "status", None) in (RunnableStatus.SHUTTING_DOWN, RunnableStatus.TERMINATED):
                 return
         self.control_time_limit()
 
@@ -501,10 +568,11 @@ class PositionExecutor(ExecutorBase):
         """
         self.cancel_open_orders()
         if self.amount_to_close >= self.trading_rules.min_order_size and close_type != CloseType.POSITION_HOLD:
+            order_type = OrderType.LIMIT if (price is not None and price.is_finite() and price > 0) else OrderType.MARKET
             order_id = self.place_order(
                 connector_name=self.config.connector_name,
                 trading_pair=self.config.trading_pair,
-                order_type=OrderType.MARKET,
+                order_type=order_type,
                 amount=self.amount_to_close,
                 price=price,
                 side=self.close_order_side,
@@ -698,9 +766,15 @@ class PositionExecutor(ExecutorBase):
         This method is responsible for processing the order canceled event
         """
         if self._close_order and event.order_id == self._close_order.order_id:
+            self._cum_close_filled_amount += self._close_order.executed_amount_base
             self._failed_orders.append(self._close_order)
             self._close_order = None
         if self._open_order and event.order_id == self._open_order.order_id:
+            if self._open_order.fee_asset == self.config.trading_pair.split("-")[0]:
+                open_filled = self._open_order.executed_amount_base - self._open_order.cum_fees_base
+            else:
+                open_filled = self._open_order.executed_amount_base
+            self._cum_open_filled_amount += open_filled
             self._failed_orders.append(self._open_order)
             self._open_order = None
         if self._take_profit_limit_order and event.order_id == self._take_profit_limit_order.order_id:
@@ -713,11 +787,17 @@ class PositionExecutor(ExecutorBase):
         failed orders list.
         """
         if self._open_order and event.order_id == self._open_order.order_id:
+            if self._open_order.fee_asset == self.config.trading_pair.split("-")[0]:
+                open_filled = self._open_order.executed_amount_base - self._open_order.cum_fees_base
+            else:
+                open_filled = self._open_order.executed_amount_base
+            self._cum_open_filled_amount += open_filled
             self._failed_orders.append(self._open_order)
             self._open_order = None
             self.logger().error(f"Open order failed {event.order_id}. Retrying {self._current_retries}/{self._max_retries}")
             self._current_retries += 1
         elif self._close_order and event.order_id == self._close_order.order_id:
+            self._cum_close_filled_amount += self._close_order.executed_amount_base
             self._failed_orders.append(self._close_order)
             self._close_order = None
             self.logger().error(f"Close order failed {event.order_id}. Retrying {self._current_retries}/{self._max_retries}")

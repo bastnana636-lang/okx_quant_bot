@@ -6,11 +6,15 @@ from typing import Literal, Optional
 from pydantic import Field, field_validator
 
 from controllers.market_making.mean_reversion import MeanReversionSettings, calculate_barriers, calculate_snapshot
-from hummingbot.core.data_type.common import MarketDict, OrderType, PositionMode, PriceType, TradeType
+from hummingbot.core.data_type.common import MarketDict, OrderType, PositionAction, PositionMode, PriceType, TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
-from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
+from hummingbot.strategy_v2.executors.position_executor.data_types import (
+    PositionExecutorConfig,
+    TrailingStop,
+    TripleBarrierConfig,
+)
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.utils.common import parse_enum_value
@@ -70,9 +74,8 @@ class PMMSimpleController(ControllerBase):
                 await self.send_actions(close_actions)
             return
 
-        # Fixed unrealized take-profit check:
-        # Closes immediately when UNREALIZED (USDT) in PERFORMANCE MATRIX > fixed_unrealized_tp_quote (> 1)
-        fixed_tp_actions = self.fixed_unrealized_tp_actions()
+        # A cash target would flatten a trend early. Momentum exits with the ATR trail.
+        fixed_tp_actions = None if self.config.signal_mode == "momentum" else self.fixed_unrealized_tp_actions()
         if fixed_tp_actions is not None:
             if fixed_tp_actions:
                 await self.send_actions(fixed_tp_actions)
@@ -181,11 +184,50 @@ class PMMSimpleController(ControllerBase):
         self.logger().info(
             f"[{self.config.trading_pair}] Fixed unrealized TP triggered: "
             f"unrealized {current_unrealized:.4f} > target {target:.4f} USDT. "
-            f"Immediately closing position."
+            f"Immediately placing limit close order to lock in target profit."
         )
         self.processed_data["reason"] = f"fixed_unrealized_tp({current_unrealized:.2f}>{target:.2f})"
         now = self.market_data_provider.time()
         self._cooldown_until = max(self._cooldown_until, now + float(self.config.cooldown_time))
+
+        # Collect client_order_ids of active close orders from executors so we don't cancel them
+        active_close_order_ids = set()
+        for executor in self.executors_info:
+            if not executor.is_done:
+                close_order = getattr(executor, "_close_order", None)
+                if close_order and getattr(close_order, "order_id", None):
+                    active_close_order_ids.add(close_order.order_id)
+                tp_order = getattr(executor, "_take_profit_limit_order", None)
+                if tp_order and getattr(tp_order, "order_id", None):
+                    active_close_order_ids.add(tp_order.order_id)
+
+        # Cancel hanging entry orders for this trading pair on the connector, preserving close orders
+        if hasattr(connector, "in_flight_orders"):
+            current_position = None
+            if hasattr(connector, "account_positions") and connector.account_positions:
+                for pos in connector.account_positions.values():
+                    if getattr(pos, "trading_pair", None) == self.config.trading_pair:
+                        current_position = pos
+                        break
+            pos_amount = getattr(current_position, "amount", Decimal("0"))
+            for order in list(connector.in_flight_orders.values()):
+                if getattr(order, "trading_pair", None) == self.config.trading_pair and not getattr(order, "is_done", True):
+                    order_id = getattr(order, "client_order_id", None)
+                    if order_id in active_close_order_ids:
+                        continue
+                    is_closing = False
+                    if getattr(order, "position_action", None) == PositionAction.CLOSE:
+                        is_closing = True
+                    elif pos_amount > 0 and getattr(order, "trade_type", None) == TradeType.SELL:
+                        is_closing = True
+                    elif pos_amount < 0 and getattr(order, "trade_type", None) == TradeType.BUY:
+                        is_closing = True
+                    if not is_closing:
+                        try:
+                            connector.cancel(self.config.trading_pair, order.client_order_id)
+                        except Exception:
+                            pass
+
         actions = []
         owns_position = False
         for executor in self.executors_info:
@@ -198,8 +240,57 @@ class PMMSimpleController(ControllerBase):
                     keep_position=False,
                 ))
         if not owns_position:
-            self._market_close_exchange_position()
+            self._limit_close_exchange_position(target)
         return actions
+
+    def _limit_close_exchange_position(self, target_quote: Decimal):
+        from decimal import Decimal
+
+        from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType
+
+        connector = self.market_data_provider.get_connector(self.config.connector_name)
+        rules = self.market_data_provider.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        min_notional = max(rules.min_notional_size, getattr(rules, "min_order_value", Decimal("0")))
+        for position in connector.account_positions.values():
+            if position.trading_pair != self.config.trading_pair or position.amount == 0:
+                continue
+            pos_amount = Decimal(str(position.amount))
+            amount = self.market_data_provider.quantize_order_amount(
+                self.config.connector_name, self.config.trading_pair, abs(pos_amount))
+            entry_price = getattr(position, "entry_price", None)
+            if entry_price is None or entry_price <= 0:
+                unrealized = getattr(position, "unrealized_pnl", Decimal("0"))
+                mid = Decimal(str(self.market_data_provider.get_price_by_type(
+                    self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)))
+                if pos_amount > 0:
+                    entry_price = mid - (Decimal(str(unrealized)) / abs(pos_amount))
+                else:
+                    entry_price = mid + (Decimal(str(unrealized)) / abs(pos_amount))
+            else:
+                entry_price = Decimal(str(entry_price))
+
+            if pos_amount > 0:
+                raw_close_price = entry_price + (target_quote / amount)
+            else:
+                raw_close_price = entry_price - (target_quote / amount)
+
+            close_price = self.market_data_provider.quantize_order_price(
+                self.config.connector_name, self.config.trading_pair, raw_close_price)
+
+            if amount <= 0 or amount < rules.min_order_size or amount * close_price < min_notional:
+                self.processed_data["reason"] = "manual_close_below_minimum"
+                continue
+
+            order = dict(
+                trading_pair=self.config.trading_pair, amount=amount,
+                order_type=OrderType.LIMIT, price=close_price,
+                position_action=PositionAction.OPEN,
+            )
+            if pos_amount > 0:
+                connector.sell(**order)
+            else:
+                connector.buy(**order)
+            self.logger().info(f"Limit close {self.config.trading_pair} amount={amount} price={close_price} target={target_quote}")
 
     def _market_close_exchange_position(self):
         from decimal import Decimal
@@ -232,7 +323,7 @@ class PMMSimpleController(ControllerBase):
 
     async def update_processed_data(self):
         self._snapshot = None
-        self.processed_data = {"strategy": "mean_reversion", "signal": 0, "reason": "waiting_for_data"}
+        self.processed_data = {"strategy": self.config.signal_mode, "signal": 0, "reason": "waiting_for_data"}
         try:
             if not self.market_data_provider.ready:
                 self.processed_data["reason"] = self._data_readiness_reason()
@@ -243,6 +334,17 @@ class PMMSimpleController(ControllerBase):
                 connector_name=self.config.connector_name, trading_pair=self.config.trading_pair,
                 interval=self.config.candles_interval, max_records=self.config.candle_records,
             )
+            if self.config.signal_mode == "momentum":
+                from controllers.market_making.momentum import momentum_snapshot
+                self._snapshot = momentum_snapshot(candles, self.market_data_provider.time(), mid, self.config)
+                snapshot = self._snapshot
+                self.processed_data.update({
+                    "signal": snapshot.signal, "reference_price": mid, "momentum": snapshot.momentum,
+                    "atr": snapshot.atr, "stop_pct": snapshot.stop_pct,
+                    "candle_timestamp": snapshot.candle_timestamp,
+                    "reason": "entry_candidate" if snapshot.signal else "momentum_below_threshold",
+                })
+                return
             self._snapshot = calculate_snapshot(candles, self.market_data_provider.time(), mid, self.config)
             snapshot = self._snapshot
             self.processed_data.update({
@@ -332,6 +434,8 @@ class PMMSimpleController(ControllerBase):
         return True
 
     def create_actions_proposal(self):
+        if self.config.signal_mode == "momentum":
+            return self._momentum_entry()
         if self.config.manual_kill_switch or self._snapshot is None or not self._snapshot.signal:
             return []
         if not self._can_enter():
@@ -388,10 +492,59 @@ class PMMSimpleController(ControllerBase):
                                     "stop_loss": barriers.stop_loss})
         return [CreateExecutorAction(controller_id=config.id, executor_config=executor_config)]
 
+    def _momentum_entry(self):
+        if self.config.manual_kill_switch or self._snapshot is None or self._snapshot.signal != 1:
+            return []
+        if not self._can_enter():
+            return []
+        from controllers.market_making.momentum import momentum_notional
+
+        config = self.config
+        provider = self.market_data_provider
+        try:
+            bid = Decimal(str(provider.get_price_by_type(config.connector_name, config.trading_pair, PriceType.BestBid)))
+            ask = Decimal(str(provider.get_price_by_type(config.connector_name, config.trading_pair, PriceType.BestAsk)))
+            if not bid.is_finite() or not ask.is_finite() or not 0 < bid < ask:
+                raise ValueError("Invalid order book")
+            mid = (bid + ask) / 2
+            if (ask - bid) / mid > config.max_bid_ask_spread_pct:
+                raise ValueError("Bid/ask spread too wide")
+            stop_pct = self._snapshot.stop_pct
+            notional = momentum_notional(config.total_amount_quote, config.risk_frac, stop_pct)
+            amount = provider.quantize_order_amount(config.connector_name, config.trading_pair, notional / ask)
+            rules = provider.get_trading_rules(config.connector_name, config.trading_pair)
+            min_notional = max(rules.min_notional_size, rules.min_order_value)
+            if amount <= 0 or amount < rules.min_order_size or amount * ask < min_notional:
+                raise ValueError("Budget below exchange minimum order size")
+            if amount * ask > notional:
+                raise ValueError("Quantized order exceeds notional budget")
+        except (ValueError, ArithmeticError) as error:
+            self.processed_data["reason"] = str(error)
+            return []
+        executor_config = PositionExecutorConfig(
+            timestamp=provider.time(), level_id="buy_0",
+            connector_name=config.connector_name, trading_pair=config.trading_pair,
+            entry_price=ask, amount=amount, leverage=config.leverage,
+            side=TradeType.BUY,
+            triple_barrier_config=TripleBarrierConfig(
+                take_profit=None, stop_loss=stop_pct, take_profit_quote=None,
+                time_limit=config.time_limit,
+                trailing_stop=TrailingStop(activation_price=Decimal("0.001"), trailing_delta=stop_pct),
+                open_order_type=OrderType.MARKET, take_profit_order_type=OrderType.MARKET,
+                stop_loss_order_type=OrderType.MARKET, time_limit_order_type=OrderType.MARKET,
+            ),
+        )
+        self._last_entry_candle = self._snapshot.candle_timestamp
+        self.processed_data.update({"reason": "entry_submitted", "stop_loss": stop_pct, "notional": notional})
+        return [CreateExecutorAction(controller_id=config.id, executor_config=executor_config)]
+
     def get_custom_info(self):
         return {key: str(value) if isinstance(value, Decimal) else value
                 for key, value in self.processed_data.items()}
 
     def to_format_status(self):
+        if self.config.signal_mode == "momentum":
+            return [f"Momentum | move={self.processed_data.get('momentum', 'n/a')} | "
+                    f"{self.processed_data.get('reason', 'waiting_for_data')}"]
         return [f"Mean reversion | z={self.processed_data.get('z_score', 'n/a')} | "
                 f"{self.processed_data.get('reason', 'waiting_for_data')}"]

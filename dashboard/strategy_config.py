@@ -20,13 +20,13 @@ FILE_NAME_RE = re.compile(r"^conf_okx_pmm_[a-z0-9]+\.yml$")
 KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(.*?)\s*$")
 INTERVALS = ("1m", "3m", "5m", "15m", "30m", "1h")
 STRATEGY_INFO = {
-    "key": "standard_5m",
-    "name": "标准均值回归 (5m)",
-    "badge": "5m 均值回归策略",
-    "interval": "5m",
-    "mean_window": 48,
-    "time_limit": 3600,
-    "description": "5分钟 K 线，4小时均值窗口，持仓时限 1 小时，动态 ATR 止损 0.6%~2%，稳健波段均值修复。",
+    "key": "momentum_1h",
+    "name": "1小时动量做多",
+    "badge": "1h 动量策略",
+    "interval": "1h",
+    "mean_window": 16,
+    "time_limit": 604800,
+    "description": "1小时K线，16小时涨幅超过0.8%才做多。止损为3倍ATR，盈利后按同样距离跟踪。单笔止损约为该品种名义上限的2%。",
 }
 
 
@@ -104,11 +104,16 @@ def render_updates(text: str, updates: dict[str, str]) -> str:
         match = KEY_RE.match(line)
         if match and match.group(1) in remaining and not line.lstrip().startswith("#"):
             key = match.group(1)
-            lines.append(f"{key}: {remaining.pop(key)}")
+            val = remaining.pop(key)
+            if val == "":
+                lines.append(f"{key}: null")
+            else:
+                lines.append(f"{key}: {val}")
         else:
             lines.append(line)
     for key, value in remaining.items():
-        lines.append(f"{key}: {value}")
+        if value != "":
+            lines.append(f"{key}: {value}")
     body = "\n".join(lines)
     if text.endswith("\n") or not text:
         body += "\n"
@@ -127,7 +132,8 @@ def load_config(script_file: Path = SCRIPT_FILE, controllers_dir: Path = CONTROL
         missing = [key for key in required if key not in raw]
         if missing:
             raise ConfigError(f"{name} 缺少字段: {', '.join(missing)}")
-        raw.setdefault("fixed_unrealized_tp_quote", "2")
+        if "fixed_unrealized_tp_quote" not in raw or raw["fixed_unrealized_tp_quote"] in ("null", "None", "", None):
+            raw["fixed_unrealized_tp_quote"] = ""
         parsed.append((name, raw))
 
     shared = {key: parsed[0][1][key] for key in SHARED_KEYS}
@@ -220,11 +226,13 @@ def _preserve_spelling(previous: str | None, normalized: str) -> str:
 def _normalize_fields(source: dict, specs) -> dict[str, str]:
     values = {}
     for key, label, kind, bounds in specs:
+        if key == "fixed_unrealized_tp_quote":
+            val_str = str(source.get(key, "")).strip()
+            if not val_str or val_str.lower() in ("none", "null", "false", ""):
+                values[key] = ""
+                continue
         if key not in source:
-            if key == "fixed_unrealized_tp_quote":
-                source[key] = "2"
-            else:
-                raise ConfigError(f"缺少 {label}")
+            raise ConfigError(f"缺少 {label}")
         values[key] = _normalize_value(label, source[key], kind, bounds)
     return values
 
@@ -296,16 +304,74 @@ def _atomic_write(path: Path, text: str) -> None:
     temporary.replace(path)
 
 
+def _long_only_enabled(raw: dict) -> bool:
+    flag = str(raw.get("long_only", "true")).strip().lower()
+    return flag not in ("false", "no", "0", "null", "none")
+
+
+def read_side_mode(script_file: Path = SCRIPT_FILE, controllers_dir: Path = CONTROLLERS_DIR) -> str:
+    """Return long_only, both, or mixed from the active controller files."""
+    names = active_controller_names(script_file)
+    flags = []
+    for name in names:
+        path = controllers_dir / name
+        if not path.is_file():
+            raise ConfigError(f"找不到控制器配置 {name}")
+        flags.append(_long_only_enabled(parse_flat_yaml(path.read_text(encoding="utf-8"))))
+    if all(flags):
+        return "long_only"
+    if not any(flags):
+        return "both"
+    return "mixed"
+
+
+def set_side_mode(long_only: bool, script_file: Path = SCRIPT_FILE,
+                  controllers_dir: Path = CONTROLLERS_DIR) -> list[str]:
+    """Write the same long_only value into every active controller file."""
+    value = "true" if long_only else "false"
+    written = []
+    for name in active_controller_names(script_file):
+        path = controllers_dir / name
+        if not path.is_file():
+            raise ConfigError(f"找不到控制器配置 {name}")
+        original = path.read_text(encoding="utf-8")
+        updated = render_updates(original, {"long_only": value})
+        if updated != original:
+            _atomic_write(path, updated)
+        written.append(name)
+    return written
+
+
 def get_strategy_info(controllers_dir: Path = CONTROLLERS_DIR) -> dict:
-    """Return active strategy metadata."""
-    return STRATEGY_INFO
+    """Return active strategy metadata dynamically calculated from active configuration."""
+    info = dict(STRATEGY_INFO)
+    try:
+        cfg = load_config(controllers_dir=controllers_dir)
+        shared = cfg.get("shared", {})
+        interval = shared.get("candles_interval") or info.get("interval", "5m")
+        mean_window = int(shared.get("mean_window") or info.get("mean_window", 48))
+        first_controller = cfg.get("pairs", [{}])[0].get("file") if cfg.get("pairs") else None
+        time_limit = 3600
+        if first_controller and (controllers_dir / first_controller).is_file():
+            raw_c = parse_flat_yaml((controllers_dir / first_controller).read_text(encoding="utf-8"))
+            time_limit = int(raw_c.get("time_limit", 3600))
+        info["interval"] = str(interval)
+        info["mean_window"] = mean_window
+        info["time_limit"] = time_limit
+        info["name"] = f"均值回归 ({interval})"
+        info["badge"] = f"{interval} 均值回归策略"
+        info["description"] = f"{interval} K 线，{mean_window} 根均值窗口，持仓时限 {time_limit} 秒，动态 ATR 止损。"
+    except Exception:
+        pass
+    return info
 
 
 def get_presets_info(controllers_dir: Path = CONTROLLERS_DIR) -> dict:
     """Compatibility wrapper returning current active strategy info."""
+    strat = get_strategy_info(controllers_dir=controllers_dir)
     return {
-        "active_preset": "standard_5m",
-        "active_meta": STRATEGY_INFO,
-        "presets": [STRATEGY_INFO],
+        "active_preset": strat.get("key", "standard_5m"),
+        "active_meta": strat,
+        "presets": [strat],
     }
 

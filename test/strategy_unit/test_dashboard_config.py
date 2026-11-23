@@ -2,7 +2,9 @@ from pathlib import Path
 
 import pytest
 
-from dashboard.strategy_config import ConfigError, apply_config, load_config, render_updates
+from dashboard.strategy_config import (
+    ConfigError, apply_config, load_config, read_side_mode, render_updates, set_side_mode,
+)
 from scripts.ensure_setup import (
     needs_setup,
     parse_env,
@@ -147,3 +149,40 @@ def test_setup_status_and_env_round_trip():
     assert needs_setup(status) is False
     exported = shell_exports({"HBOT_PASSWORD": "a'b"})
     assert exported == "export HBOT_PASSWORD='a'\\''b'"
+
+
+def test_side_mode_writes_every_active_controller(tmp_path: Path):
+    script, controllers = _layout(tmp_path)
+    assert read_side_mode(script, controllers) == "long_only"
+    written = set_side_mode(False, script, controllers)
+    assert written == ["conf_okx_pmm_btc.yml", "conf_okx_pmm_eth.yml"]
+    btc = (controllers / "conf_okx_pmm_btc.yml").read_text(encoding="utf-8")
+    eth = (controllers / "conf_okx_pmm_eth.yml").read_text(encoding="utf-8")
+    assert btc.startswith("# comment stays")
+    assert "long_only: false" in btc
+    assert "long_only: false" in eth
+    assert "total_amount_quote: 180" in btc
+    assert read_side_mode(script, controllers) == "both"
+    set_side_mode(True, script, controllers)
+    assert "long_only: true" in (controllers / "conf_okx_pmm_btc.yml").read_text(encoding="utf-8")
+    assert read_side_mode(script, controllers) == "long_only"
+
+
+def test_side_mode_reports_a_mixed_book(tmp_path: Path):
+    script, controllers = _layout(tmp_path)
+    set_side_mode(False, script, controllers)
+    btc = controllers / "conf_okx_pmm_btc.yml"
+    btc.write_text(btc.read_text(encoding="utf-8").replace("long_only: false", "long_only: true"), encoding="utf-8")
+    assert read_side_mode(script, controllers) == "mixed"
+
+
+def test_switch_saves_the_mode_before_restart(monkeypatch):
+    import dashboard.dashboard as page
+    order = []
+    monkeypatch.setattr(page, "set_side_mode", lambda long_only: order.append(("save", long_only)) or ["conf_okx_pmm_btc.yml"])
+    monkeypatch.setattr(page, "restart_strategy", lambda: order.append(("restart",)) or (True, "重新启动已开始"))
+    started, message, mode = page.switch_side_mode(False)
+    assert started is True
+    assert mode == "both"
+    assert "多空双向" in message
+    assert order == [("save", False), ("restart",)]

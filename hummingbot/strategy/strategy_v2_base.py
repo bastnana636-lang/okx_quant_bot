@@ -21,6 +21,7 @@ from hummingbot.core.clock import Clock
 from hummingbot.core.data_type.common import MarketDict, PositionMode
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.event.events import OrderType, PositionAction
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.exceptions import InvalidController
@@ -287,6 +288,8 @@ class StrategyV2Base(StrategyPyBase):
             strategy=self,
             initial_positions_by_controller=self._collect_initial_positions()
         )
+        self._startup_positions_initialized = False
+        self._startup_reconcile_task: Optional[asyncio.Task] = None
 
     # -------------------------------------------------------------------------
     # Shared methods (simple + V2 modes)
@@ -300,12 +303,25 @@ class StrategyV2Base(StrategyPyBase):
         :param timestamp: current tick timestamp
         """
         if not self.ready_to_trade:
-            self.ready_to_trade = all(ex.ready for ex in self.connectors.values())
-            if not self.ready_to_trade:
+            if not all(ex.ready for ex in self.connectors.values()):
                 for con in [c for c in self.connectors.values() if not c.ready]:
                     self.logger().warning(f"{con.name} is not ready. Please wait...")
                 return
-            self.executor_orchestrator.initialize_initial_positions()
+            if not self._startup_positions_initialized:
+                self._startup_positions_initialized = True
+                self.executor_orchestrator.initialize_initial_positions()
+                result = self.executor_orchestrator.reconcile_held_positions_with_exchange()
+                if inspect.isawaitable(result):
+                    self._startup_reconcile_task = safe_ensure_future(result)
+            if self._startup_reconcile_task is not None and not self._startup_reconcile_task.done():
+                return
+            if self._startup_reconcile_task is not None and self._startup_reconcile_task.done():
+                exc = self._startup_reconcile_task.exception()
+                if exc is not None:
+                    self.logger().warning(
+                        f"Position reconcile failed: {exc}. Continuing with local positions."
+                    )
+            self.ready_to_trade = True
         else:
             self.on_tick()
 
@@ -608,6 +624,108 @@ class StrategyV2Base(StrategyPyBase):
         if len(warning_lines) > 0:
             lines.extend(["", "*** WARNINGS ***"] + warning_lines)
         return "\n".join(lines)
+
+    def get_structured_status(self) -> Dict[str, Any]:
+        """
+        Returns structured status data (performance, positions_held, executors, orders, signals).
+        Used by snapshot writer for dashboards and reporting without relying on format_status ASCII text parsing.
+        """
+        performance_data = []
+        positions_held_data = []
+        executors_data = []
+        signals_data = {}
+        active_orders_data = []
+
+        # 1. Orders
+        try:
+            for connector_name, connector in self.connectors.items():
+                for order in self.get_active_orders(connector_name):
+                    active_orders_data.append({
+                        "connector": connector_name,
+                        "pair": order.trading_pair,
+                        "side": "BUY" if order.is_buy else "SELL",
+                        "price": float(order.price),
+                        "amount": float(order.quantity),
+                        "age": float(order.age()) if order.age() > 0 else 0.0,
+                    })
+        except Exception:
+            pass
+
+        # 2. Controllers data
+        if self.controllers:
+            for controller_id, controller in self.controllers.items():
+                # Signals & custom info
+                try:
+                    if hasattr(controller, "get_custom_info"):
+                        signals_data[controller_id] = controller.get_custom_info()
+                    elif hasattr(controller, "processed_data"):
+                        signals_data[controller_id] = dict(controller.processed_data)
+                except Exception:
+                    pass
+
+                # Executors
+                try:
+                    executors_list = self.get_executors_by_controller(controller_id)
+                    if executors_list:
+                        recent_executors = sorted(executors_list, key=lambda x: x.timestamp, reverse=True)[:6]
+                        for exc in recent_executors:
+                            executors_data.append({
+                                "controller": controller_id,
+                                "side": exc.side.name if hasattr(exc.side, "name") else str(exc.side),
+                                "status": exc.status.name if hasattr(exc.status, "name") else str(exc.status),
+                                "net_pnl_pct": float(exc.net_pnl_pct) if hasattr(exc, "net_pnl_pct") else 0.0,
+                                "net_pnl": float(exc.net_pnl_quote) if hasattr(exc, "net_pnl_quote") else 0.0,
+                                "volume": float(exc.filled_amount_quote) if hasattr(exc, "filled_amount_quote") else 0.0,
+                                "is_trading": bool(getattr(exc, "is_trading", False)),
+                                "close_type": exc.close_type.name if getattr(exc, "close_type", None) and hasattr(exc.close_type, "name") else (str(exc.close_type) if getattr(exc, "close_type", None) else ""),
+                                "age": float(self.current_timestamp - exc.timestamp) if hasattr(self, "current_timestamp") and exc.timestamp else 0.0,
+                            })
+                except Exception:
+                    pass
+
+                # Positions Held
+                try:
+                    positions = self.get_positions_by_controller(controller_id)
+                    if positions:
+                        for pos in positions:
+                            positions_held_data.append({
+                                "connector": pos.connector_name,
+                                "pair": pos.trading_pair,
+                                "side": pos.side.name if hasattr(pos.side, "name") else str(pos.side),
+                                "amount": float(pos.amount),
+                                "value": float(pos.amount * pos.breakeven_price),
+                                "breakeven": float(pos.breakeven_price),
+                                "unrealized": float(pos.unrealized_pnl_quote),
+                                "realized": float(pos.realized_pnl_quote),
+                                "fees": float(pos.cum_fees_quote),
+                                "controller_id": controller_id,
+                            })
+                except Exception:
+                    pass
+
+                # Performance report
+                try:
+                    report = self.get_performance_report(controller_id)
+                    if report:
+                        performance_data.append({
+                            "controller": controller_id,
+                            "realized": float(report.realized_pnl_quote),
+                            "unrealized": float(report.unrealized_pnl_quote),
+                            "global": float(report.global_pnl_quote),
+                            "global_pct": f"{float(report.global_pnl_pct):.2f}%",
+                            "volume": float(report.volume_traded),
+                            "close_type_counts": getattr(report, "close_type_counts", {}),
+                        })
+                except Exception:
+                    pass
+
+        return {
+            "performance": performance_data,
+            "positions_held": positions_held_data,
+            "executors": executors_data,
+            "orders": active_orders_data,
+            "signals": signals_data,
+        }
 
     def _market_trading_pair_tuple(self,
                                    connector_name: str,

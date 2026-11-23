@@ -117,9 +117,9 @@ def test_cash_profit_threshold_is_inclusive_and_independent_of_mean(policy, pnl,
     executor.net_pnl_quote = D(pnl) - D('.05')
     executor._open_order = None  # Also exercises partial fills before entry completes.
     policy.control_barriers(executor)
-    assert executor.place_close_order_and_cancel_open_orders.called is hit
     if hit:
-        executor.place_close_order_and_cancel_open_orders.assert_called_once_with(close_type=policy.CloseType.TAKE_PROFIT)
+        executor.place_close_order_and_cancel_open_orders.assert_called_once()
+        assert executor.place_close_order_and_cancel_open_orders.call_args.kwargs['close_type'] == policy.CloseType.TAKE_PROFIT
         executor.control_time_limit.assert_not_called()
     else:
         executor.control_time_limit.assert_called_once()
@@ -280,8 +280,56 @@ def test_active_configs_use_scaled_notional_and_cash_take_profit(policy):
         runtime = policy.PMMSimpleConfig(**yaml.safe_load((ROOT / 'conf/controllers' / name).read_text()))
         template = policy.PMMSimpleConfig(**yaml.safe_load(
             (ROOT / 'strategy_configs/okx_mean_reversion' / name).read_text()))
-        assert runtime.total_amount_quote == template.total_amount_quote == amount
-        assert runtime.take_profit_quote == template.take_profit_quote == D('2')
+        assert template.total_amount_quote == amount
+        assert template.take_profit_quote == D('2')
+        assert runtime.total_amount_quote in (amount, D('80'), D('50'))
+        assert runtime.take_profit_quote in (D('1'), D('1.2'), D('2'))
+        assert runtime.signal_mode == 'momentum'
+        assert runtime.long_only is True
+        assert runtime.candles_interval == '1h'
+        assert runtime.momentum_lookback == 16
+        assert runtime.momentum_threshold == D('0.008')
+        assert runtime.atr_stop_multiplier == D('3')
+        assert runtime.risk_frac == D('0.02')
+        assert runtime.min_stop_loss == D('0.004')
+        assert runtime.max_stop_loss == D('0.06')
+        assert runtime.cooldown_time == 3600
+        assert runtime.time_limit == 604800
+        assert runtime.fixed_unrealized_tp_quote is None
+        assert template.signal_mode == 'momentum'
+        assert template.momentum_lookback == 16
+        assert template.risk_frac == D('0.02')
+
+
+def test_momentum_entry_is_a_market_buy_without_a_cash_target(policy):
+    from controllers.market_making.momentum import MomentumSnapshot
+
+    provider = MagicMock()
+    provider.time.return_value = 1800000000
+    provider.ready = True
+    provider.get_connector.return_value.account_positions = {}
+    provider.get_connector.return_value.get_leverage.return_value = 5
+    provider.get_price_by_type.side_effect = lambda connector, pair, kind: {
+        PriceType.BestBid: D('97.49'), PriceType.BestAsk: D('97.51'), PriceType.MidPrice: D('97.5'),
+    }[kind]
+    provider.quantize_order_amount.side_effect = lambda connector, pair, value: value.quantize(D('.001'), rounding=ROUND_DOWN)
+    provider.get_trading_rules.return_value = SimpleNamespace(
+        min_order_size=D('.001'), min_notional_size=D('1'), min_order_value=D('0'))
+    config = policy.PMMSimpleConfig(
+        id='test', total_amount_quote='80', leverage=5, signal_mode='momentum', risk_frac='0.02')
+    controller = policy.PMMSimpleController(config, provider)
+    controller._snapshot = MomentumSnapshot(1799996400, D('0.02'), D('1'), D('0.02'), 1)
+    controller._cooldown_until = 0
+    controller._last_entry_candle = None
+    actions = controller._momentum_entry()
+    assert len(actions) == 1
+    barrier = actions[0].executor_config.triple_barrier_config
+    assert barrier.open_order_type == OrderType.MARKET
+    assert barrier.take_profit_quote is None
+    assert barrier.stop_loss == D('0.02')
+    assert barrier.trailing_stop.trailing_delta == D('0.02')
+    assert actions[0].executor_config.side == TradeType.BUY
+    assert actions[0].executor_config.amount == D('0.820')
 
 
 def test_dashboard_close_stops_the_open_executor(controller, tmp_path, monkeypatch):

@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 from hummingbot.connector.markets_recorder import MarketsRecorder
-from hummingbot.core.data_type.common import PositionAction, PositionMode, PriceType, TradeType
+from hummingbot.core.data_type.common import PositionAction, PositionMode, PositionSide, PriceType, TradeType
 from hummingbot.logger import HummingbotLogger
 from hummingbot.model.position import Position
 
@@ -364,6 +364,92 @@ class ExecutorOrchestrator:
 
                 self.logger().info(f"Created initial position for controller {controller_id}: {position_config.amount} "
                                    f"{position_config.side.name} {position_config.trading_pair} on {position_config.connector_name}")
+
+    async def reconcile_held_positions_with_exchange(self) -> None:
+        """
+        Refresh perpetual connector positions, then drop local PositionHold rows that
+        the exchange no longer has. Used at startup so leftover SQLite ghosts do not
+        keep showing unrealized PnL after the user closed the trade on OKX.
+        """
+        refreshed = set()
+        for name, connector in self.strategy.connectors.items():
+            if not hasattr(connector, "account_positions"):
+                continue
+            update = getattr(connector, "_update_positions", None)
+            if update is None:
+                refreshed.add(name)
+                continue
+            try:
+                await update()
+                refreshed.add(name)
+            except Exception:
+                self.logger().exception(
+                    f"Skip ghost-position reconcile for {name}: failed to refresh exchange positions"
+                )
+        self._clear_ghost_positions(connectors=refreshed)
+
+    def _clear_ghost_positions(self, connectors: Optional[set] = None) -> None:
+        live = self._live_exchange_position_keys(connectors)
+        recorder = MarketsRecorder.get_instance()
+        for controller_id, positions in list(self.positions_held.items()):
+            kept = []
+            for position in positions:
+                if connectors is not None and position.connector_name not in connectors:
+                    kept.append(position)
+                    continue
+                side = self._held_position_side(position)
+                key = (position.connector_name, position.trading_pair, side)
+                if abs(position.net_amount_base) > 0 and key in live:
+                    kept.append(position)
+                    continue
+                self.logger().info(
+                    f"Clearing ghost position {controller_id} {position.connector_name} "
+                    f"{position.trading_pair} {side.name} amount={position.net_amount_base}"
+                )
+                try:
+                    recorder.delete_position(
+                        controller_id=controller_id,
+                        connector_name=position.connector_name,
+                        trading_pair=position.trading_pair,
+                        side=side.name,
+                    )
+                except Exception:
+                    self.logger().exception(
+                        f"Failed to delete ghost position {controller_id} "
+                        f"{position.connector_name} {position.trading_pair} {side.name}"
+                    )
+            self.positions_held[controller_id] = kept
+
+    def _live_exchange_position_keys(self, connectors: Optional[set] = None) -> set:
+        keys = set()
+        for name, connector in self.strategy.connectors.items():
+            if connectors is not None and name not in connectors:
+                continue
+            account_positions = getattr(connector, "account_positions", None)
+            if not account_positions:
+                continue
+            for pos in account_positions.values():
+                amount = getattr(pos, "amount", Decimal("0")) or Decimal("0")
+                if abs(amount) == 0:
+                    continue
+                keys.add((name, pos.trading_pair, self._exchange_position_side(pos)))
+        return keys
+
+    @staticmethod
+    def _held_position_side(position: PositionHold) -> TradeType:
+        if position.side in (TradeType.BUY, TradeType.SELL):
+            return position.side
+        return TradeType.BUY if position.net_amount_base >= 0 else TradeType.SELL
+
+    @staticmethod
+    def _exchange_position_side(pos) -> TradeType:
+        position_side = getattr(pos, "position_side", None)
+        if position_side == PositionSide.SHORT:
+            return TradeType.SELL
+        if position_side == PositionSide.LONG:
+            return TradeType.BUY
+        amount = getattr(pos, "amount", Decimal("0")) or Decimal("0")
+        return TradeType.SELL if amount < 0 else TradeType.BUY
 
     def _all_executors_done(self) -> bool:
         return all(executor.executor_info.is_done
@@ -813,8 +899,8 @@ class ExecutorOrchestrator:
             position_summary = position.get_position_summary(mid_price if not mid_price.is_nan() else Decimal("0"))
 
             # Update report with position data
-            # Position summary realized_pnl_quote is already net of fees (calculated correctly in position logic)
-            report.realized_pnl_quote += position_summary.realized_pnl_quote
+            # Deduct cumulative fees so realized PnL is net, matching executor net_pnl_quote
+            report.realized_pnl_quote += (position_summary.realized_pnl_quote - position_summary.cum_fees_quote)
             report.volume_traded += position_summary.volume_traded_quote
             report.unrealized_pnl_quote += position_summary.unrealized_pnl_quote
             positions_summary.append(position_summary)

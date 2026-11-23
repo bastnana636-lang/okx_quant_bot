@@ -615,23 +615,30 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
         raw_responses: List[Dict[str, Any]] = await safe_gather(*position_tasks, return_exceptions=True)
 
         # Initial parsing of responses. Joining all the responses
+        successful_pairs = set()
         parsed_resps: List[Dict[str, Any]] = []
         for resp, trading_pair in zip(raw_responses, self._trading_pairs):
             if not isinstance(resp, Exception):
-                result = resp["data"]
+                successful_pairs.add(trading_pair)
+                result = resp.get("data", [])
                 if result:
                     position_entries = result if isinstance(result, list) else [result]
                     parsed_resps.extend(position_entries)
             else:
                 self.logger().error(f"Error fetching positions for {trading_pair}. Response: {resp}")
 
+        if self._trading_pairs and len(successful_pairs) == 0:
+            raise IOError(f"Failed to fetch positions for any trading pair on {self.name}")
+
+        pairs_with_positions = set()
         for data in parsed_resps:
             ex_trading_pair = data["instId"]
             hb_trading_pair = await self.trading_pair_associated_to_exchange_symbol(ex_trading_pair)
+            pairs_with_positions.add(hb_trading_pair)
             position_side = self.get_position_side(data)
             unrealized_pnl = Decimal(data["upl"]) if bool(data["upl"]) else Decimal(str(0.0))
             entry_price = Decimal(data["avgPx"]) if bool(data["avgPx"]) else Decimal(str(0.0))
-            amount = self.get_position_amount(data)
+            amount = self.get_position_amount(data, hb_trading_pair)
             leverage = Decimal(data["lever"]) if bool(data["lever"]) else Decimal(str(0.0))
             pos_key = self._perpetual_trading.position_key(hb_trading_pair, position_side)
             if amount != s_decimal_0:
@@ -647,6 +654,14 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
             else:
                 self._perpetual_trading.remove_position(pos_key)
 
+        # For pairs successfully queried that returned empty position list, clear cached positions
+        for hb_trading_pair in successful_pairs:
+            if hb_trading_pair not in pairs_with_positions:
+                for side in (PositionSide.LONG, PositionSide.SHORT):
+                    pos_key = self._perpetual_trading.position_key(hb_trading_pair, side)
+                    if pos_key in self._perpetual_trading.account_positions:
+                        self._perpetual_trading.remove_position(pos_key)
+
     @staticmethod
     def get_position_side(position_msg: Dict[str, Any]) -> PositionSide:
         if position_msg.get("posSide") == "net":
@@ -655,15 +670,38 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
             position_side = PositionSide.LONG if position_msg.get("posSide") == "long" else PositionSide.SHORT
         return position_side
 
-    @staticmethod
-    def get_position_amount(position_msg: Dict[str, Any]) -> Decimal:
-        if bool(position_msg["notionalUsd"]):
-            notional_usd = Decimal(position_msg["notionalUsd"])
-            avg_px = Decimal(position_msg["avgPx"])
-            amount = abs(notional_usd / avg_px) if notional_usd != s_decimal_0 else s_decimal_0
-            return max(amount, round(amount))
-        else:
-            return Decimal("0.0")
+    def get_position_amount(self, position_msg: Dict[str, Any], trading_pair: Optional[str] = None) -> Decimal:
+        pos_raw = position_msg.get("pos")
+        if pos_raw is not None and str(pos_raw).strip() != "":
+            try:
+                pos_qty = abs(Decimal(str(pos_raw)))
+                if pos_qty == s_decimal_0:
+                    return s_decimal_0
+                ct_val = None
+                if position_msg.get("ctVal"):
+                    try:
+                        ct_val = Decimal(str(position_msg["ctVal"]))
+                    except Exception:
+                        pass
+                if ct_val is None and trading_pair and hasattr(self, "_contract_sizes") and trading_pair in self._contract_sizes:
+                    ct_val = self._contract_sizes[trading_pair]
+                if ct_val is not None and ct_val > s_decimal_0:
+                    return pos_qty * ct_val
+            except Exception:
+                pass
+
+        if bool(position_msg.get("notionalUsd")):
+            notional_usd = abs(Decimal(str(position_msg["notionalUsd"])))
+            px_val = position_msg.get("markPx") or position_msg.get("avgPx")
+            if px_val and Decimal(str(px_val)) != s_decimal_0:
+                return notional_usd / abs(Decimal(str(px_val)))
+
+        if pos_raw is not None:
+            try:
+                return abs(Decimal(str(pos_raw)))
+            except Exception:
+                pass
+        return Decimal("0.0")
 
     async def _process_account_position_event(self, position_msg: Dict[str, Any]):
         """
@@ -675,7 +713,7 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
             trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=ex_trading_pair)
             position_side = self.get_position_side(position_msg)
             entry_price = Decimal(position_msg["avgPx"]) if bool(position_msg["avgPx"]) else Decimal("0")
-            amount = self.get_position_amount(position_msg)
+            amount = self.get_position_amount(position_msg, trading_pair)
             leverage = Decimal(position_msg["lever"]) if bool(position_msg["lever"]) else Decimal("0")
             unrealized_pnl = Decimal(position_msg["upl"]) if bool(position_msg["upl"]) else Decimal("0")
             pos_key = self._perpetual_trading.position_key(trading_pair, position_side)

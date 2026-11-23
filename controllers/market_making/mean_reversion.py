@@ -33,7 +33,12 @@ class MeanReversionSettings(BaseModel):
     cooldown_time: int = Field(default=300, ge=1)
     stop_loss_cooldown_time: int = Field(default=900, ge=1)
     time_limit: int = Field(default=3600, ge=60)
-    require_closed_candle_confirmation: bool = Field(default=False)
+    require_closed_candle_confirmation: bool = Field(default=True)
+    signal_mode: Literal["reversion", "momentum"] = "reversion"
+    momentum_lookback: int = Field(default=16, ge=2, le=500)
+    momentum_threshold: Decimal = Field(default=Decimal("0.008"), ge=0, lt=1)
+    risk_frac: Decimal = Field(default=Decimal("0.02"), gt=0, lt=1)
+    long_only: bool = True
 
     @model_validator(mode="after")
     def validate_relationships(self):
@@ -53,7 +58,7 @@ class MeanReversionSettings(BaseModel):
 
     @property
     def candle_records(self):
-        return max(self.mean_window, self.atr_length + 1) + 2
+        return max(self.mean_window, self.atr_length + 1, self.momentum_lookback + 1) + 2
 
 
 @dataclass(frozen=True)

@@ -56,6 +56,20 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.strategy.tick(self.start_timestamp + 10)
         self.assertTrue(self.strategy.ready_to_trade)
 
+    async def test_tick_waits_for_position_reconcile(self):
+        loop = asyncio.get_running_loop()
+        pending = loop.create_future()
+        self.strategy.executor_orchestrator.reconcile_held_positions_with_exchange.return_value = pending
+
+        self.strategy.tick(self.start_timestamp + 10)
+        self.assertFalse(self.strategy.ready_to_trade)
+        self.strategy.executor_orchestrator.initialize_initial_positions.assert_called_once()
+
+        pending.set_result(None)
+        await asyncio.sleep(0)
+        self.strategy.tick(self.start_timestamp + 11)
+        self.assertTrue(self.strategy.ready_to_trade)
+
     def test_init_markets(self):
         StrategyV2Base.init_markets(self.strategy_config)
         # With no controllers configured, markets should be empty

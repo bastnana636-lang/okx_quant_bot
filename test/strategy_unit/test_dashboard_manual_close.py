@@ -208,3 +208,67 @@ def test_handler_post_restart_and_stop_validation(monkeypatch):
     assert data["ok"] is True
     assert data["message"] == "策略已停止"
 
+
+def test_session_metrics_persists_across_panel_restart(tmp_path, monkeypatch):
+    baseline_file = tmp_path / "session_baseline.json"
+    monkeypatch.setattr(view, "SESSION_BASELINE_FILE", baseline_file)
+
+    view.reset_session_baseline()
+    assert not baseline_file.exists()
+
+    engine = {"start_time": 100000, "uptime": 10}
+    perf1 = [
+        {"controller": "okx_pmm_btc", "realized": 10.0, "unrealized": 0.0, "global": 10.0, "global_pct": "0.1%", "volume": 1000},
+        {"controller": "okx_pmm_eth", "realized": 5.0, "unrealized": 0.0, "global": 5.0, "global_pct": "0.1%", "volume": 500},
+        {"controller": "GLOBAL TOTAL", "realized": 15.0, "unrealized": 0.0, "global": 15.0, "global_pct": "0.1%", "volume": 1500},
+    ]
+
+    r1, u1, g1, pct1, hist1 = view._sync_session_metrics(engine, 1000, perf1, 500.0)
+    assert r1 == 0.0
+    assert g1 == 0.0
+    assert baseline_file.is_file()
+
+    # Trade occurs: btc gains +2.5 realized
+    perf2 = [
+        {"controller": "okx_pmm_btc", "realized": 12.5, "unrealized": 0.5, "global": 13.0, "global_pct": "0.1%", "volume": 1200},
+        {"controller": "okx_pmm_eth", "realized": 5.0, "unrealized": 0.0, "global": 5.0, "global_pct": "0.1%", "volume": 500},
+        {"controller": "GLOBAL TOTAL", "realized": 17.5, "unrealized": 0.5, "global": 18.0, "global_pct": "0.1%", "volume": 1700},
+    ]
+    r2, u2, g2, pct2, hist2 = view._sync_session_metrics(engine, 1005, perf2, 502.5)
+    assert r2 == 2.5
+    assert u2 == 0.5
+    assert g2 == 3.0
+
+    # 1. 模拟仅重启面板（内存清空，但磁盘 session_baseline.json 仍保留）
+    with view._session_lock:
+        view._session_data["session_key"] = None
+        view._session_data["baseline_assets"] = None
+        view._session_data["baseline_realized_by_ctrl"] = {}
+        view._session_data["history"] = []
+
+    # 重启面板后，策略 bot 没变（engine start_time 仍为 100000）
+    perf3 = [
+        {"controller": "okx_pmm_btc", "realized": 12.5, "unrealized": 0.5, "global": 13.0, "global_pct": "0.1%", "volume": 1200},
+        {"controller": "okx_pmm_eth", "realized": 5.0, "unrealized": 0.0, "global": 5.0, "global_pct": "0.1%", "volume": 500},
+        {"controller": "GLOBAL TOTAL", "realized": 17.5, "unrealized": 0.5, "global": 18.0, "global_pct": "0.1%", "volume": 1700},
+    ]
+    r3, u3, g3, pct3, hist3 = view._sync_session_metrics(engine, 1007, perf3, 502.5)
+    # 盈亏不应该被清零！仍维持 2.5 已实现与 3.0 全局盈亏
+    assert r3 == 2.5
+    assert u3 == 0.5
+    assert g3 == 3.0
+
+    # 2. 模拟重启策略 bot（engine start_time 变为 200000）
+    engine_restarted = {"start_time": 200000, "uptime": 1}
+    perf4 = [
+        {"controller": "okx_pmm_btc", "realized": 12.5, "unrealized": 0.0, "global": 12.5, "global_pct": "0.1%", "volume": 1200},
+        {"controller": "okx_pmm_eth", "realized": 5.0, "unrealized": 0.0, "global": 5.0, "global_pct": "0.1%", "volume": 500},
+        {"controller": "GLOBAL TOTAL", "realized": 17.5, "unrealized": 0.0, "global": 17.5, "global_pct": "0.1%", "volume": 1700},
+    ]
+    r4, u4, g4, pct4, hist4 = view._sync_session_metrics(engine_restarted, 2000, perf4, 502.5)
+    # 重启策略 bot 后，盈亏清零重算！
+    assert r4 == 0.0
+    assert u4 == 0.0
+    assert g4 == 0.0
+
+

@@ -1168,3 +1168,95 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.assertEqual(len(result["controller2"]["executors"]), 0)
         self.assertEqual(len(result["controller3"]["executors"]), 0)
         self.assertEqual(len(result["controller3"]["positions"]), 0)
+
+    def _okx_position(self, trading_pair: str, side, amount: Decimal, entry: Decimal):
+        from hummingbot.connector.derivative.position import Position as ExchangePosition
+        from hummingbot.core.data_type.common import PositionSide
+        signed = -amount if side == PositionSide.SHORT else amount
+        return ExchangePosition(
+            trading_pair=trading_pair,
+            position_side=side,
+            unrealized_pnl=Decimal("0"),
+            entry_price=entry,
+            amount=signed,
+            leverage=Decimal("3"),
+        )
+
+    @patch("hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder.get_instance")
+    def test_clear_ghost_positions_removes_missing_exchange_holds(self, mock_get_instance: MagicMock):
+        from hummingbot.core.data_type.common import PositionSide
+
+        recorder = MagicMock(spec=MarketsRecorder)
+        mock_get_instance.return_value = recorder
+        ghost = PositionHold("okx_perpetual", "SOL-USDT", TradeType.SELL)
+        ghost.net_amount_base = Decimal("-0.42")
+        ghost.avg_entry_price = Decimal("117")
+        live = PositionHold("okx_perpetual", "ETH-USDT", TradeType.BUY)
+        live.net_amount_base = Decimal("0.01")
+        live.avg_entry_price = Decimal("3000")
+        other = PositionHold("binance_perpetual", "BTC-USDT", TradeType.BUY)
+        other.net_amount_base = Decimal("0.002")
+        self.orchestrator.positions_held = {
+            "okx_pmm_sol": [ghost],
+            "okx_pmm_eth": [live],
+            "binance_ctrl": [other],
+        }
+        okx = MagicMock()
+        okx.account_positions = {
+            "ETH-USDT": self._okx_position("ETH-USDT", PositionSide.LONG, Decimal("0.01"), Decimal("3000")),
+        }
+        self.mock_strategy.connectors = {"okx_perpetual": okx}
+
+        self.orchestrator._clear_ghost_positions(connectors={"okx_perpetual"})
+
+        self.assertEqual(self.orchestrator.positions_held["okx_pmm_sol"], [])
+        self.assertEqual(self.orchestrator.positions_held["okx_pmm_eth"], [live])
+        self.assertEqual(self.orchestrator.positions_held["binance_ctrl"], [other])
+        recorder.delete_position.assert_called_once_with(
+            controller_id="okx_pmm_sol",
+            connector_name="okx_perpetual",
+            trading_pair="SOL-USDT",
+            side="SELL",
+        )
+
+    @patch("hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder.get_instance")
+    def test_reconcile_skips_clear_when_position_refresh_fails(self, mock_get_instance: MagicMock):
+        recorder = MagicMock(spec=MarketsRecorder)
+        mock_get_instance.return_value = recorder
+        ghost = PositionHold("okx_perpetual", "SOL-USDT", TradeType.SELL)
+        ghost.net_amount_base = Decimal("-0.42")
+        self.orchestrator.positions_held = {"okx_pmm_sol": [ghost]}
+
+        async def fail_update():
+            raise RuntimeError("okx down")
+
+        okx = MagicMock()
+        okx.account_positions = {}
+        okx._update_positions = fail_update
+        self.mock_strategy.connectors = {"okx_perpetual": okx}
+
+        asyncio.run(self.orchestrator.reconcile_held_positions_with_exchange())
+
+        self.assertEqual(self.orchestrator.positions_held["okx_pmm_sol"], [ghost])
+        recorder.delete_position.assert_not_called()
+
+    @patch("hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder.get_instance")
+    def test_reconcile_clears_ghosts_after_successful_refresh(self, mock_get_instance: MagicMock):
+        recorder = MagicMock(spec=MarketsRecorder)
+        mock_get_instance.return_value = recorder
+        ghost = PositionHold("okx_perpetual", "ZEC-USDT", TradeType.SELL)
+        ghost.net_amount_base = Decimal("-0.03")
+        self.orchestrator.positions_held = {"okx_pmm_zec": [ghost]}
+
+        async def ok_update():
+            return None
+
+        okx = MagicMock()
+        okx.account_positions = {}
+        okx._update_positions = ok_update
+        self.mock_strategy.connectors = {"okx_perpetual": okx}
+
+        asyncio.run(self.orchestrator.reconcile_held_positions_with_exchange())
+
+        self.assertEqual(self.orchestrator.positions_held["okx_pmm_zec"], [])
+        recorder.delete_position.assert_called_once()

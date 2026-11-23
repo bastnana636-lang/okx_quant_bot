@@ -27,12 +27,12 @@ from pathlib import Path
 try:
     from strategy_config import (
         SHARED_FIELDS, ConfigError, apply_config,
-        get_presets_info, get_strategy_info, load_config, STRATEGY_INFO,
+        get_presets_info, get_strategy_info, load_config, read_side_mode, set_side_mode, STRATEGY_INFO,
     )
 except ImportError:  # imported as dashboard.dashboard
     from dashboard.strategy_config import (
         SHARED_FIELDS, ConfigError, apply_config,
-        get_presets_info, get_strategy_info, load_config, STRATEGY_INFO,
+        get_presets_info, get_strategy_info, load_config, read_side_mode, set_side_mode, STRATEGY_INFO,
     )
 
 
@@ -41,6 +41,7 @@ BASE_DIR = Path(os.environ.get("OKX_TRADER_ROOT", Path(__file__).parent.parent))
 STATUS_FILE = BASE_DIR / "data" / "bot" / "status.json"
 LOG_FILE    = BASE_DIR / "logs" / "logs_conf_okx_multi.log"
 MANUAL_CLOSES_FILE = BASE_DIR / "data" / "dashboard" / "manual_closes.json"
+SESSION_BASELINE_FILE = BASE_DIR / "data" / "dashboard" / "session_baseline.json"
 PORT        = 8888
 STALE_AFTER_S = 20  # 引擎每 5 秒写一次快照；超过该秒数视为过期
 OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
@@ -66,7 +67,7 @@ def _launch_control(action: str) -> tuple[bool, str]:
             active_label = labels.get(_control_action or "", "控制操作")
             return False, f"{active_label}已在进行中，请稍候。"
         launcher = BASE_DIR / "native" / "launcher.py"
-        if not launcher.is_file():
+        if not getattr(sys, "frozen", False) and not launcher.is_file():
             return False, f"找不到启动器：{launcher}"
         log_path = BASE_DIR / "dashboard" / f"{action}.log"
         log_handle = log_path.open("a", encoding="utf-8")
@@ -86,7 +87,11 @@ def _launch_control(action: str) -> tuple[bool, str]:
         else:
             kwargs["start_new_session"] = True
         try:
-            _control_process = subprocess.Popen([sys.executable, str(launcher), action], **kwargs)
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, action]
+            else:
+                cmd = [sys.executable, str(launcher), action]
+            _control_process = subprocess.Popen(cmd, **kwargs)
             _control_action = action
         except OSError as exc:
             return False, f"无法启动{label}进程：{exc}"
@@ -99,8 +104,29 @@ def _launch_control(action: str) -> tuple[bool, str]:
 
 
 def restart_strategy() -> tuple[bool, str]:
-    reset_session_baseline()
-    return _launch_control("start")
+    success, msg = _launch_control("start")
+    if success:
+        reset_session_baseline()
+    return success, msg
+
+
+def switch_side_mode(long_only: bool) -> tuple[bool, str, str]:
+    """Save long-only or both-sides, then restart so the running process reloads it."""
+    with _config_lock:
+        set_side_mode(long_only)
+    mode = "long_only" if long_only else "both"
+    label = "只做多" if long_only else "多空双向"
+    started, message = restart_strategy()
+    if started:
+        return True, f"已切换为{label}，并开始重启。{message}", mode
+    return False, f"已切换为{label}，但重启没有开始：{message}", mode
+
+
+def current_side_mode() -> str:
+    try:
+        return read_side_mode()
+    except Exception:
+        return "long_only"
 
 
 def stop_strategy() -> tuple[bool, str]:
@@ -352,7 +378,33 @@ def build_markets(pairs: list[str]) -> tuple[str, str]:
 
 
 def parse_controller_signals(status: dict) -> dict[str, dict]:
-    """从 format_status 中解析出每个 Controller 的 z-score 和信号状态。"""
+    """优先从 strategy_data.signals 中获取控制器状态，否则从 format_status 正则解析。"""
+    strategy_data = status.get("strategy_data")
+    if isinstance(strategy_data, dict) and "signals" in strategy_data and isinstance(strategy_data["signals"], dict):
+        controllers = {}
+        for ctrl, info in strategy_data["signals"].items():
+            if not isinstance(info, dict):
+                continue
+            z_val = None
+            if "z_score" in info and info["z_score"] not in (None, "n/a", ""):
+                try:
+                    z_val = float(info["z_score"])
+                except (ValueError, TypeError):
+                    pass
+            actual_sig = 0
+            if "signal" in info:
+                try:
+                    actual_sig = int(info["signal"])
+                except (ValueError, TypeError):
+                    pass
+            controllers[ctrl] = {
+                "z": z_val,
+                "reason": str(info.get("reason", "")),
+                "signal": actual_sig,
+            }
+        if controllers:
+            return controllers
+
     text = status.get("format_status") or ""
     controllers = {}
     current_ctrl = None
@@ -383,7 +435,24 @@ def parse_controller_signals(status: dict) -> dict[str, dict]:
 
 
 def parse_performance_table(status: dict) -> list[dict]:
-    """从 format_status 文本解析出 PERFORMANCE SUMMARY 表格行。"""
+    """优先从 strategy_data 读取结构化绩效，否则从 format_status 正则解析。"""
+    strategy_data = status.get("strategy_data")
+    if isinstance(strategy_data, dict) and "performance" in strategy_data and isinstance(strategy_data["performance"], list):
+        rows = []
+        for item in strategy_data["performance"]:
+            if not isinstance(item, dict):
+                continue
+            rows.append({
+                "controller": str(item.get("controller", "")),
+                "realized":   float(item.get("realized", 0.0)),
+                "unrealized": float(item.get("unrealized", 0.0)),
+                "global":     float(item.get("global", 0.0)),
+                "global_pct": str(item.get("global_pct", "0.00%")),
+                "volume":     float(item.get("volume", 0.0)),
+            })
+        if rows:
+            return rows
+
     text = status.get("format_status") or ""
     rows = []
     in_perf = False
@@ -411,7 +480,117 @@ def parse_performance_table(status: dict) -> list[dict]:
 
 
 def parse_positions(status: dict) -> list[dict]:
-    """从 format_status 解析持仓行（Positions Held 表格）。"""
+    """优先从 account_positions (交易所账户持仓) 与 strategy_data.positions_held 汇集，否则正则解析 format_status。"""
+    acc_pos_raw = status.get("account_positions")
+    strat_pos_raw = (status.get("strategy_data") or {}).get("positions_held") if isinstance(status.get("strategy_data"), dict) else None
+
+    if acc_pos_raw is not None or strat_pos_raw is not None:
+        positions = []
+        seen_pairs = set()
+
+        held_by_pair = {}
+        if isinstance(strat_pos_raw, list):
+            for p in strat_pos_raw:
+                if not isinstance(p, dict):
+                    continue
+                pair = str(p.get("pair") or p.get("trading_pair", "")).upper()
+                side = str(p.get("side", "")).upper()
+                side = "BUY" if side in ("BUY", "LONG") else "SELL"
+                item = {
+                    "connector":  str(p.get("connector", "okx_perpetual")),
+                    "pair":       pair,
+                    "side":       side,
+                    "amount":     float(p.get("amount", 0.0)),
+                    "value":      float(p.get("value", 0.0) or (float(p.get("amount", 0.0)) * float(p.get("breakeven", 0.0)))),
+                    "breakeven":  float(p.get("breakeven", 0.0) or p.get("breakeven_price", 0.0)),
+                    "unrealized": float(p.get("unrealized", 0.0) or p.get("unrealized_pnl_quote", 0.0)),
+                    "realized":   float(p.get("realized", 0.0) or p.get("realized_pnl_quote", 0.0)),
+                    "fees":       float(p.get("fees", 0.0) or p.get("cum_fees_quote", 0.0)),
+                    "source":     "策略接管",
+                }
+                held_by_pair[pair] = item
+
+        if isinstance(acc_pos_raw, dict):
+            for conn_name, pos_list in acc_pos_raw.items():
+                if not isinstance(pos_list, list):
+                    continue
+                for pos in pos_list:
+                    if not isinstance(pos, dict):
+                        continue
+                    amount = float(pos.get("amount", 0.0))
+                    if amount == 0.0:
+                        continue
+                    pair = str(pos.get("trading_pair") or pos.get("pair", "")).upper()
+                    side = str(pos.get("side", "")).upper()
+                    side = "BUY" if side in ("BUY", "LONG") else "SELL"
+                    entry_px = float(pos.get("entry_price", 0.0))
+                    upl = float(pos.get("unrealized_pnl", 0.0))
+                    seen_pairs.add(pair)
+
+                    if pair in held_by_pair:
+                        item = held_by_pair[pair]
+                        item["amount"] = amount
+                        item["unrealized"] = upl
+                        item["value"] = amount * (entry_px or item["breakeven"])
+                        if entry_px > 0:
+                            item["breakeven"] = entry_px
+                        item["source"] = "OKX 账户仓位"
+                        positions.append(item)
+                    else:
+                        positions.append({
+                            "connector":  conn_name,
+                            "pair":       pair,
+                            "side":       side,
+                            "amount":     amount,
+                            "value":      amount * entry_px,
+                            "breakeven":  entry_px,
+                            "unrealized": upl,
+                            "realized":   0.0,
+                            "fees":       0.0,
+                            "source":     "OKX 账户仓位",
+                        })
+        elif isinstance(acc_pos_raw, list):
+            for pos in acc_pos_raw:
+                if not isinstance(pos, dict):
+                    continue
+                amount = float(pos.get("amount", 0.0))
+                if amount == 0.0:
+                    continue
+                pair = str(pos.get("trading_pair") or pos.get("pair", "")).upper()
+                side = str(pos.get("side", "")).upper()
+                side = "BUY" if side in ("BUY", "LONG") else "SELL"
+                entry_px = float(pos.get("entry_price", 0.0))
+                upl = float(pos.get("unrealized_pnl", 0.0))
+                seen_pairs.add(pair)
+                if pair in held_by_pair:
+                    item = held_by_pair[pair]
+                    item["amount"] = amount
+                    item["unrealized"] = upl
+                    item["value"] = amount * (entry_px or item["breakeven"])
+                    if entry_px > 0:
+                        item["breakeven"] = entry_px
+                    item["source"] = "OKX 账户仓位"
+                    positions.append(item)
+                else:
+                    positions.append({
+                        "connector":  str(pos.get("connector", "okx_perpetual")),
+                        "pair":       pair,
+                        "side":       side,
+                        "amount":     amount,
+                        "value":      amount * entry_px,
+                        "breakeven":  entry_px,
+                        "unrealized": upl,
+                        "realized":   0.0,
+                        "fees":       0.0,
+                        "source":     "OKX 账户仓位",
+                    })
+
+        for pair, item in held_by_pair.items():
+            if pair not in seen_pairs:
+                positions.append(item)
+
+        return positions
+
     text = status.get("format_status") or ""
     positions = []
     for line in text.splitlines():
@@ -430,6 +609,7 @@ def parse_positions(status: dict) -> list[dict]:
                 "unrealized":  float(m.group(7)),
                 "realized":    float(m.group(8)),
                 "fees":        float(m.group(9)),
+                "source":      "策略接管",
             })
     return positions
 
@@ -586,7 +766,28 @@ def apply_manual_closes(positions: list[dict], perf_rows: list[dict]) -> tuple[l
 
 
 def parse_orders(status: dict) -> list[dict]:
-    """从 format_status 解析当前挂单行（空格分隔格式）。"""
+    """优先从 strategy_data.orders 获取挂单，否则正则解析 format_status。"""
+    strategy_data = status.get("strategy_data")
+    if isinstance(strategy_data, dict) and "orders" in strategy_data and isinstance(strategy_data["orders"], list):
+        orders = []
+        for o in strategy_data["orders"]:
+            if not isinstance(o, dict):
+                continue
+            age_val = o.get("age", 0)
+            if isinstance(age_val, (int, float)):
+                age_str = f"{int(age_val)//3600:02d}:{(int(age_val)%3600)//60:02d}:{int(age_val)%60:02d}"
+            else:
+                age_str = str(age_val)
+            orders.append({
+                "connector": str(o.get("connector", "")),
+                "pair":      str(o.get("pair", "")),
+                "side":      str(o.get("side", "")).upper(),
+                "price":     float(o.get("price", 0.0)),
+                "amount":    float(o.get("amount", 0.0)),
+                "age":       age_str,
+            })
+        return orders
+
     text = status.get("format_status") or ""
     orders = []
     in_orders = False
@@ -617,7 +818,26 @@ def parse_orders(status: dict) -> list[dict]:
 
 
 def parse_executors(status: dict) -> list[dict]:
-    """从 format_status 解析 Recent Executors 行。"""
+    """从 strategy_data 读取结构化执行器，否则从 format_status 正则解析。"""
+    strategy_data = status.get("strategy_data")
+    if isinstance(strategy_data, dict) and "executors" in strategy_data and isinstance(strategy_data["executors"], list):
+        executors = []
+        for e in strategy_data["executors"]:
+            if not isinstance(e, dict):
+                continue
+            executors.append({
+                "controller":  str(e.get("controller", "")),
+                "side":        str(e.get("side", "")).replace("TradeType.", ""),
+                "status":      str(e.get("status", "")).replace("RunnableStatus.", ""),
+                "net_pnl_pct": float(e.get("net_pnl_pct", 0.0)),
+                "net_pnl":     float(e.get("net_pnl", 0.0)),
+                "volume":      float(e.get("volume", 0.0)),
+                "is_trading":  bool(e.get("is_trading", False)),
+                "close_type":  str(e.get("close_type", "") or "").replace("CloseType.", ""),
+                "age":         float(e.get("age", 0.0)),
+            })
+        return executors
+
     text = status.get("format_status") or ""
     executors = []
     current_ctrl = None
@@ -688,6 +908,29 @@ _session_data = {
 }
 
 
+def _load_session_baseline() -> dict | None:
+    try:
+        if SESSION_BASELINE_FILE.is_file():
+            with open(SESSION_BASELINE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and "session_key" in data and "baseline_realized_by_ctrl" in data:
+                    return data
+    except Exception as exc:
+        _log(f"无法读取 session_baseline.json: {exc}")
+    return None
+
+
+def _save_session_baseline(data: dict) -> None:
+    try:
+        SESSION_BASELINE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp_file = SESSION_BASELINE_FILE.with_suffix(".json.tmp")
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        tmp_file.replace(SESSION_BASELINE_FILE)
+    except Exception as exc:
+        _log(f"无法保存 session_baseline.json: {exc}")
+
+
 def reset_session_baseline() -> None:
     """策略重新启动时调用，强制归零本机挂单操作盈亏与已实现/未实现盈亏。"""
     with _session_lock:
@@ -695,18 +938,51 @@ def reset_session_baseline() -> None:
         _session_data["baseline_assets"] = None
         _session_data["baseline_realized_by_ctrl"] = {}
         _session_data["history"] = []
+        try:
+            if SESSION_BASELINE_FILE.is_file():
+                SESSION_BASELINE_FILE.unlink()
+            if MANUAL_CLOSES_FILE.is_file():
+                MANUAL_CLOSES_FILE.unlink()
+        except OSError:
+            pass
 
 
-def _sync_session_metrics(engine: dict, updated_at: float, perf_rows: list[dict], usdt_bal: float) -> tuple[float, float, float, str, list[dict]]:
+def _sync_session_metrics(
+    engine: dict,
+    updated_at: float,
+    perf_rows: list[dict],
+    usdt_bal: float,
+    bot_pid: int | None = None,
+) -> tuple[float, float, float, str, list[dict]]:
     """
-    每次重启清零重算 REALIZED / UNREALIZED；
+    仅在策略bot重启时清零重算 REALIZED / UNREALIZED；
+    面板独立重启时从持久化存储恢复基线，不清零；
     GLOBAL PNL 不使用历史统计，就用 REALIZED 和 UNREALIZED 求和；
     返回: (global_realized, global_unrealized, global_pnl, glob_pct, session_history)
     """
-    raw_start = engine.get("start_time") or engine.get("uptime") or 0
-    session_key = str(raw_start)
+    raw_start = engine.get("start_time") or 0
+    if raw_start:
+        session_key = str(raw_start)
+    elif bot_pid:
+        session_key = f"pid_{bot_pid}"
+    else:
+        session_key = str(engine.get("uptime") or 0)
 
     with _session_lock:
+        # 1. 若内存尚未加载 session，优先尝试从持久化文件恢复基线（支持仅重启面板不清零）
+        if _session_data["session_key"] is None:
+            persisted = _load_session_baseline()
+            if (
+                persisted
+                and persisted.get("session_key") == session_key
+                and persisted.get("baseline_realized_by_ctrl")
+            ):
+                _session_data["session_key"] = persisted["session_key"]
+                _session_data["baseline_assets"] = persisted.get("baseline_assets")
+                _session_data["baseline_realized_by_ctrl"] = dict(persisted.get("baseline_realized_by_ctrl", {}))
+                _session_data["history"] = list(persisted.get("history", []))
+
+        # 2. 若检测到策略bot重启（session_key 发生变化）或 baseline 尚未初始化，则重新设定基准
         if _session_data["session_key"] != session_key or not _session_data["baseline_realized_by_ctrl"]:
             _session_data["session_key"] = session_key
             _session_data["baseline_assets"] = float(usdt_bal)
@@ -717,10 +993,16 @@ def _sync_session_metrics(engine: dict, updated_at: float, perf_rows: list[dict]
                 {"t": int(updated_at - 60) if updated_at else int(time.time() - 60), "bot_pnl": 0.0, "assets": round(float(usdt_bal), 2)},
                 {"t": int(updated_at) if updated_at else int(time.time()), "bot_pnl": 0.0, "assets": round(float(usdt_bal), 2)},
             ]
+            if _session_data["baseline_realized_by_ctrl"]:
+                _save_session_baseline(_session_data)
         else:
+            changed = False
             for r in perf_rows:
                 if r["controller"] not in _session_data["baseline_realized_by_ctrl"]:
                     _session_data["baseline_realized_by_ctrl"][r["controller"]] = float(r["realized"])
+                    changed = True
+            if changed:
+                _save_session_baseline(_session_data)
 
         base_map = dict(_session_data["baseline_realized_by_ctrl"])
 
@@ -756,6 +1038,8 @@ def _sync_session_metrics(engine: dict, updated_at: float, perf_rows: list[dict]
                 hist.append({"t": int(updated_at), "bot_pnl": global_pnl, "assets": round(float(usdt_bal), 2)})
                 if len(hist) > 150:
                     hist.pop(0)
+                if _session_data["session_key"] is not None:
+                    _save_session_baseline(_session_data)
         session_history = list(_session_data["history"])
 
     return global_realized, global_unrealized, global_pnl, glob_pct, session_history
@@ -765,7 +1049,44 @@ def build_view(status: dict) -> dict:
     """把 status.json 收成面板可原地补丁的字段（数字 + 表格 HTML）。"""
     err = status.get("error")
     if err:
-        return {"error": str(err)}
+        strategy_info = get_strategy_info()
+        return {
+            "error": str(err),
+            "updated_at": 0,
+            "snapshot_age_s": None,
+            "uptime_s": 0,
+            "uptime_str": "-",
+            "uptime": "-",
+            "running": False,
+            "stale": True,
+            "strategy": "-",
+            "status_html": '<span class="badge gray"><span class="status-dot"></span>UNKNOWN</span>',
+            "snapshot_badge_html": '<span class="badge red">NO SNAPSHOT</span>',
+            "usdt_bal": "0.00",
+            "bot_session_pnl_html": "+0.0000",
+            "bot_session_pnl_cls": "zero",
+            "history": [],
+            "global_pnl_html": "+0.0000 (0.00%)",
+            "global_pnl_cls": "zero",
+            "realized_html": "+0.0000",
+            "realized_cls": "zero",
+            "unrealized_html": "+0.0000",
+            "unrealized_cls": "zero",
+            "stale_html": f'<div class="banner warn">状态快照不可用: {html.escape(str(err))}。如果策略刚启动或尚未运行，请等待刷新。</div>',
+            "updated_str": "-",
+            "perf_html": f'<tr><td colspan="7" class="empty">状态数据暂不可用（{html.escape(str(err))}），等待引擎启动...</td></tr>',
+            "pos_html": '<tr><td colspan="7" class="empty">暂无数据</td></tr>',
+            "manual_close_note": "",
+            "ord_html": '<tr><td colspan="6" class="empty">暂无数据</td></tr>',
+            "exec_html": '<tr><td colspan="6" class="empty">暂无数据</td></tr>',
+            "log_html": "等待日志...",
+            "active_preset": "standard_5m",
+            "active_preset_name": strategy_info.get("name", "5m 均值回归"),
+            "active_preset_badge": strategy_info.get("badge", "5m"),
+            "target_preset": "",
+            "switch_btn_label": "",
+            "side_mode": current_side_mode(),
+        }
 
     engine    = status.get("engine", {}) or {}
     balances  = (status.get("balances", {}) or {}).get("okx_perpetual", {}) or {}
@@ -784,7 +1105,7 @@ def build_view(status: dict) -> dict:
 
     usdt_bal = float(balances.get("USDT", 0) or 0)
     realized, unrealized, global_pnl, glob_pct, session_history = _sync_session_metrics(
-        engine, updated_at, perf_rows, usdt_bal
+        engine, updated_at, perf_rows, usdt_bal, bot_pid=status.get("pid")
     )
 
     perf_html = ""
@@ -797,15 +1118,17 @@ def build_view(status: dict) -> dict:
             sig = signals.get(ctrl)
             z_val = sig.get("z") if sig else None
             reason = sig.get("reason", "") if sig else ""
+            actual_signal = sig.get("signal", 0) if sig else 0
             if z_val is None:
                 z_cell = '<td><span class="badge gray">n/a</span></td>'
-            elif z_val >= 2.0:
-                z_cell = f'<td><span class="badge yellow" title="{reason}">⚡ {z_val:+.2f} (SELL)</span></td>'
-            elif z_val <= -2.0:
-                z_cell = f'<td><span class="badge yellow" title="{reason}">⚡ {z_val:+.2f} (BUY)</span></td>'
+            elif actual_signal == 1:
+                z_cell = f'<td><span class="badge green" title="{reason}">⚡ {z_val:+.2f} (BUY)</span></td>'
+            elif actual_signal == -1:
+                z_cell = f'<td><span class="badge red" title="{reason}">⚡ {z_val:+.2f} (SELL)</span></td>'
             else:
                 z_cls = "pos" if z_val > 0 else ("neg" if z_val < 0 else "zero")
-                z_cell = f'<td><span class="{z_cls}" title="{reason}">{z_val:+.2f}</span></td>'
+                note = f' title="{reason}"' if reason else ""
+                z_cell = f'<td><span class="{z_cls}"{note}>{z_val:+.2f}</span></td>'
 
         if ctrl == "GLOBAL TOTAL":
             close_cell = "<td>-</td>"
@@ -834,9 +1157,10 @@ def build_view(status: dict) -> dict:
         side = html.escape(p["side"], quote=True)
         amount = f"{p['amount']:.8f}"
         breakeven = f"{p['breakeven']:.4f}"
+        source_badge = f' <span class="badge gray" style="font-size:10px;margin-left:4px;">{html.escape(p.get("source", ""))}</span>' if p.get("source") else ""
         pos_html += (
             f"<tr>"
-            f"<td>{html.escape(p['pair'])}</td>"
+            f"<td>{html.escape(p['pair'])}{source_badge}</td>"
             f'<td><button type="button" class="manual-close" data-pair="{pair}" '
             f'data-side="{side}" data-amount="{amount}" data-breakeven="{breakeven}">已手动平仓</button></td>'
             f'<td class="{side_cls}">{p["side"]}</td>'
@@ -909,6 +1233,8 @@ def build_view(status: dict) -> dict:
         "updated_at": updated_at,
         "snapshot_age_s": round(snapshot_age, 1) if snapshot_age is not None else None,
         "uptime_s": uptime_s,
+        "uptime_str": f"{int(uptime_s) // 3600:02d}:{(int(uptime_s) % 3600) // 60:02d}:{int(uptime_s) % 60:02d}" if uptime_s else "-",
+        "uptime": f"{int(uptime_s) // 3600:02d}:{(int(uptime_s) % 3600) // 60:02d}:{int(uptime_s) % 60:02d}" if uptime_s else "-",
         "running": running,
         "stale": stale,
         "strategy": engine.get("strategy_file_name", "-") or "-",
@@ -943,6 +1269,7 @@ def build_view(status: dict) -> dict:
         "active_preset_badge": strategy_info["badge"],
         "target_preset": "",
         "switch_btn_label": "",
+        "side_mode": current_side_mode(),
     }
 
 
@@ -1019,6 +1346,12 @@ def render_config_body() -> str:
         )
 
     strategy = view.get("strategy") or STRATEGY_INFO
+    try:
+        side_mode = read_side_mode()
+    except ConfigError:
+        side_mode = "long_only"
+    long_active = "active" if side_mode == "long_only" else ""
+    both_active = "active" if side_mode == "both" else ""
 
     return f"""
         <form id="config-form">
@@ -1047,6 +1380,14 @@ def render_config_body() -> str:
                 </div>
               </div>
               <p style="font-size: 12px; color: var(--color-muted); line-height: 1.5;">{html.escape(strategy["description"])}</p>
+              <div class="side-mode-row">
+                <span class="meta-box-label">持仓方向</span>
+                <div class="side-switch" role="group" aria-label="持仓方向">
+                  <button type="button" id="side-long" class="btn side-btn {long_active}" onclick="setSideMode(true)">只做多</button>
+                  <button type="button" id="side-both" class="btn side-btn {both_active}" onclick="setSideMode(false)">多空双向</button>
+                </div>
+                <span class="side-mode-note">切换后会立即重启策略</span>
+              </div>
             </div>
           </div>
 
@@ -1457,6 +1798,49 @@ def render_html(status: dict, page: str = "dashboard") -> str:
     .btn-action-neg:hover {{
       background: rgba(244, 63, 94, 0.18);
       border-color: #f43f5e;
+    }}
+
+    .side-switch {{
+      display: inline-flex;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 3px;
+      overflow: hidden;
+    }}
+
+    .side-mode-row {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 14px;
+      flex-wrap: wrap;
+    }}
+
+    .side-mode-note {{
+      font-size: 12px;
+      color: var(--color-muted);
+    }}
+
+    .side-btn {{
+      background: transparent;
+      color: var(--color-ink-faint);
+      border: none;
+      border-radius: 0;
+      padding: 6px 10px;
+      font-size: 12px;
+    }}
+
+    .side-btn + .side-btn {{
+      border-left: 1px solid rgba(255, 255, 255, 0.14);
+    }}
+
+    .side-btn.active {{
+      background: rgba(56, 189, 248, 0.16);
+      color: #e6f6ff;
+    }}
+
+    .side-btn:disabled {{
+      opacity: 0.55;
+      cursor: default;
     }}
 
     .btn-primary {{
@@ -2060,6 +2444,21 @@ def render_html(status: dict, page: str = "dashboard") -> str:
       justify-content: space-between;
     }}
 
+    @media (max-width: 1366px) {{
+      .site-header {{
+        height: auto;
+        padding: 8px 16px;
+        flex-wrap: wrap;
+        gap: 8px;
+      }}
+      .brand-section {{
+        min-width: auto;
+      }}
+      .top-status-group {{
+        margin-left: auto;
+      }}
+    }}
+
     @media (max-width: 900px) {{
       .stat-ribbon {{
         grid-template-columns: repeat(2, 1fr);
@@ -2083,23 +2482,49 @@ def render_html(status: dict, page: str = "dashboard") -> str:
       var lastHistory = [];
       var autoScroll = true;
       var lastSnapshotAt = {view.get("updated_at", 0)};
+      var marketsTimer = null;
 
       function $(id) {{ return document.getElementById(id); }}
 
       function updateSnapshotAge() {{
         var el = $('snapshot-age');
-        if (!el || !lastSnapshotAt || lastSnapshotAt <= 0) return;
+        var footLatency = $('footer-latency');
+        var footStatus = $('footer-engine-status');
+        if (!lastSnapshotAt || lastSnapshotAt <= 0) {{
+          if (el) el.textContent = 'NO SNAPSHOT';
+          if (footLatency) footLatency.textContent = 'UNKNOWN';
+          if (footStatus) {{
+            footStatus.textContent = 'OFFLINE';
+            footStatus.style.color = 'var(--color-neg)';
+          }}
+          return;
+        }}
         var age = Math.max(0, Math.floor(Date.now() / 1000 - lastSnapshotAt));
-        el.textContent = age < 60 ? (age + 's ago') : ((age / 60).toFixed(1) + 'm ago');
+        var ageText = age < 60 ? (age + 's ago') : ((age / 60).toFixed(1) + 'm ago');
+        if (el) el.textContent = ageText;
+        if (footLatency) footLatency.textContent = ageText;
         if (age > 15) {{
-          el.className = 'snapshot-age-tag neg';
+          if (el) el.className = 'snapshot-age-tag neg';
+          patch('snapshot-badge', '<span class="badge red">STALE</span>');
+          if (footStatus) {{
+            footStatus.textContent = 'DATA STALE';
+            footStatus.style.color = 'var(--color-warn)';
+          }}
         }} else {{
-          el.className = 'snapshot-age-tag';
+          if (el) el.className = 'snapshot-age-tag';
+          if (footStatus) {{
+            footStatus.textContent = 'ENGINE ONLINE';
+            footStatus.style.color = 'var(--color-pos)';
+          }}
         }}
       }}
 
       window.switchTab = function(tabName) {{
         closeDialog();
+        if (marketsTimer) {{
+          clearInterval(marketsTimer);
+          marketsTimer = null;
+        }}
         var tabs = document.querySelectorAll('.tab-btn');
         var panes = document.querySelectorAll('.tab-pane');
         tabs.forEach(function(b) {{ b.classList.toggle('active', b.getAttribute('data-tab') === tabName); }});
@@ -2112,6 +2537,7 @@ def render_html(status: dict, page: str = "dashboard") -> str:
           renderChart(lastHistory, chartMode);
         }} else if (tabName === 'markets') {{
           pollMarkets();
+          marketsTimer = setInterval(pollMarkets, MARKETS_POLL_MS);
         }}
       }};
 
@@ -2283,7 +2709,7 @@ def render_html(status: dict, page: str = "dashboard") -> str:
           idx = Math.max(0, Math.min(history.length - 1, idx));
           var item = history[idx];
           var hX = getX(idx);
-          var hY = getY(item.bot_pnl, minVal, maxVal);
+          var hY = (chartMode === 'assets') ? getY(item.assets, minAst, maxAst) : getY(item.bot_pnl, minVal, maxVal);
 
           var ch = $('chart-crosshair');
           var dot = $('chart-hover-dot');
@@ -2357,6 +2783,7 @@ def render_html(status: dict, page: str = "dashboard") -> str:
             if (uEl && data.unrealized_cls) uEl.className = data.unrealized_cls;
             patch('uptime', data.uptime_str || data.uptime);
             patch('stale-banner', data.stale_html || '');
+            applySideMode(data.side_mode);
             patch('perf-body', data.perf_html);
             patch('pos-body', data.pos_html);
             patch('manual-close-note', data.manual_close_note || '');
@@ -2374,7 +2801,19 @@ def render_html(status: dict, page: str = "dashboard") -> str:
               renderChart(lastHistory, chartMode);
             }}
           }})
-          .catch(function(err) {{}});
+          .catch(function(err) {{
+            patch('status-badge', '<span class="badge gray"><span class="status-dot"></span>DISCONNECTED</span>');
+            patch('snapshot-badge', '<span class="badge red">OFFLINE</span>');
+            var footStatus = $('footer-engine-status');
+            if (footStatus) {{
+              footStatus.textContent = 'DISCONNECTED';
+              footStatus.style.color = 'var(--color-neg)';
+            }}
+            var banner = $('stale-banner');
+            if (banner) {{
+              banner.innerHTML = '<div class="banner error">无法连接到仪表盘后台服务，正在重试...</div>';
+            }}
+          }});
       }}
 
       function pollMarkets() {{
@@ -2404,6 +2843,45 @@ def render_html(status: dict, page: str = "dashboard") -> str:
           }}).catch(function() {{
             alert('重启请求发送异常');
             if (btn) btn.disabled = false;
+          }});
+      }};
+
+      function applySideMode(mode) {{
+        var longBtn = $('side-long');
+        var bothBtn = $('side-both');
+        if (longBtn) longBtn.classList.toggle('active', mode === 'long_only');
+        if (bothBtn) bothBtn.classList.toggle('active', mode === 'both');
+      }}
+
+      window.setSideMode = function(longOnly) {{
+        var mode = longOnly ? 'long_only' : 'both';
+        var active = longOnly ? $('side-long') : $('side-both');
+        if (active && active.classList.contains('active')) return;
+        var label = longOnly ? '只做多' : '多空双向';
+        if (!confirm('切换为' + label + '并重启策略？重启后本机挂单盈亏将立即自动归零。')) return;
+        var longBtn = $('side-long');
+        var bothBtn = $('side-both');
+        if (longBtn) longBtn.disabled = true;
+        if (bothBtn) bothBtn.disabled = true;
+        fetch('/api/side-mode', {{
+          method: 'POST',
+          headers: {{
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'OKX-Dashboard'
+          }},
+          body: JSON.stringify({{ long_only: longOnly }})
+        }})
+          .then(function(r) {{ return r.json().then(function(data) {{ return {{ ok: r.ok, data: data }}; }}); }})
+          .then(function(result) {{
+            alert((result.data && result.data.message) || '切换请求已发送');
+            if (result.data && result.data.side_mode) applySideMode(result.data.side_mode);
+            if (longBtn) longBtn.disabled = false;
+            if (bothBtn) bothBtn.disabled = false;
+            poll();
+          }}).catch(function() {{
+            alert('切换请求发送异常');
+            if (longBtn) longBtn.disabled = false;
+            if (bothBtn) bothBtn.disabled = false;
           }});
       }};
 
@@ -2854,7 +3332,7 @@ def render_html(status: dict, page: str = "dashboard") -> str:
   <!-- ─── Institutional Footer ─── -->
   <footer class="site-footer">
     <span>OKX QUANTITATIVE TRADER // PRO INSTITUTIONAL TERMINAL · 5M MEAN REVERSION</span>
-    <span>STATUS: <span style="color:var(--color-pos)">ENGINE ONLINE</span> · LATENCY {age_label}</span>
+    <span>STATUS: <span id="footer-engine-status" style="color:var(--color-pos)">ENGINE ONLINE</span> · LATENCY <span id="footer-latency">{age_label}</span></span>
   </footer>
 </body>
 </html>"""
@@ -2919,12 +3397,34 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             path = self.path.split("?", 1)[0].rstrip("/") or "/"
-            if path in ("/api/restart", "/api/stop"):
+            if path in ("/api/restart", "/api/stop", "/api/side-mode"):
                 if self.client_address[0] not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
                     self._send_json(403, {"ok": False, "message": "只允许从本机控制策略。"})
                     return
                 if (self.headers.get("X-Requested-With") or "").strip().lower() != "okx-dashboard":
                     self._send_json(403, {"ok": False, "message": "请求校验失败。"})
+                    return
+                if path == "/api/side-mode":
+                    length = int(self.headers.get("Content-Length", "0") or "0")
+                    if length < 0 or length > 4_000:
+                        self._send_json(413, {"ok": False, "message": "请求过大"})
+                        return
+                    try:
+                        payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                    except json.JSONDecodeError:
+                        self._send_json(400, {"ok": False, "message": "请求不是 JSON"})
+                        return
+                    if not isinstance(payload, dict) or not isinstance(payload.get("long_only"), bool):
+                        self._send_json(400, {"ok": False, "message": "需要 long_only 布尔值"})
+                        return
+                    try:
+                        started, message, mode = switch_side_mode(payload["long_only"])
+                    except ConfigError as exc:
+                        self._send_json(400, {"ok": False, "message": str(exc)})
+                        return
+                    self._send_json(202 if started else 409, {
+                        "ok": started, "message": message, "side_mode": mode,
+                    })
                     return
                 control = restart_strategy if path == "/api/restart" else stop_strategy
                 started, message = control()
@@ -2989,6 +3489,12 @@ class Handler(BaseHTTPRequestHandler):
             if path != "/api/config":
                 self.send_response(404)
                 self.end_headers()
+                return
+            if self.client_address[0] not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+                self._send_json(403, {"ok": False, "message": "只允许从本机修改配置。"})
+                return
+            if (self.headers.get("X-Requested-With") or "").strip().lower() != "okx-dashboard":
+                self._send_json(403, {"ok": False, "message": "请求校验失败。"})
                 return
             length = int(self.headers.get("Content-Length", "0") or "0")
             if length < 0 or length > 256_000:

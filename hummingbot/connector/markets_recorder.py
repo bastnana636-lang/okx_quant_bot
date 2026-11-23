@@ -258,6 +258,17 @@ class MarketsRecorder:
 
             session.commit()
 
+    def delete_position(self, controller_id: str, connector_name: str, trading_pair: str, side: str) -> int:
+        with self._sql_manager.get_new_session() as session:
+            deleted = session.query(Position).filter(
+                Position.controller_id == controller_id,
+                Position.connector_name == connector_name,
+                Position.trading_pair == trading_pair,
+                Position.side == side,
+            ).delete(synchronize_session=False)
+            session.commit()
+            return deleted
+
     def store_controller_config(self, controller_config: ControllerConfigBase):
         with self._sql_manager.get_new_session() as session:
             config = json.loads(controller_config.json())

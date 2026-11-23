@@ -17,7 +17,7 @@ import os
 import signal
 import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from hummingbot.cli import bot
 from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger
@@ -61,6 +61,46 @@ async def _format_status_text(hb: HummingbotApplication) -> Optional[str]:
         return None
 
 
+async def _collect_positions(hb: HummingbotApplication) -> Dict[str, List[Dict[str, Any]]]:
+    positions: Dict[str, List[Dict[str, Any]]] = {}
+    tc = hb.trading_core
+    for name, connector in list(tc.connector_manager.connectors.items()):
+        try:
+            if hasattr(connector, "account_positions"):
+                pos_list = []
+                for pair, pos in connector.account_positions.items():
+                    amount = float(pos.amount)
+                    if amount != 0.0:
+                        pos_list.append({
+                            "connector": name,
+                            "trading_pair": pos.trading_pair,
+                            "side": pos.position_side.name if hasattr(pos.position_side, "name") else str(pos.position_side),
+                            "amount": abs(amount),
+                            "entry_price": float(pos.entry_price) if hasattr(pos, "entry_price") else 0.0,
+                            "unrealized_pnl": float(pos.unrealized_pnl) if hasattr(pos, "unrealized_pnl") else 0.0,
+                            "leverage": float(pos.leverage) if hasattr(pos, "leverage") else 1.0,
+                        })
+                positions[name] = pos_list
+        except Exception:
+            continue
+    return positions
+
+
+async def _collect_strategy_data(hb: HummingbotApplication) -> Optional[Dict[str, Any]]:
+    strategy = hb.trading_core.strategy
+    if strategy is None:
+        return None
+    try:
+        if hasattr(strategy, "get_structured_status"):
+            result = strategy.get_structured_status()
+            if inspect.iscoroutine(result):
+                result = await result
+            return result
+    except Exception:
+        pass
+    return None
+
+
 async def _write_snapshot(hb: HummingbotApplication, name: str, *, running: bool) -> None:
     snapshot: Dict[str, Any] = {
         "name": name,
@@ -75,6 +115,8 @@ async def _write_snapshot(hb: HummingbotApplication, name: str, *, running: bool
     snapshot["format_status"] = await _format_status_text(hb)
     if running:
         snapshot["balances"] = await _collect_balances(hb)
+        snapshot["account_positions"] = await _collect_positions(hb)
+        snapshot["strategy_data"] = await _collect_strategy_data(hb)
     bot.write_status(snapshot)
 
 
