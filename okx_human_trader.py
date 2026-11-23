@@ -8,6 +8,9 @@ OKX Perpetual Aggressive Dual-Engine Trader (Holding Period <= 1 Day)
 - 激进型杠杆管理: 主流币(BTC, ETH) 15x 杠杆; 高波山寨币(SOL, DOGE, XRP, ADA, SUI, LINK, LTC, AVAX) 10x 杠杆
 - 仓位与资金管理: 单笔保证金设置为账户当前权益的 20% (上限 2,500 USDT)，最多同时持仓 3 笔
 - 交易摩擦优化: 采用 Post-Only 限价挂单 (Maker 手续费 0.02% + 零滑点 0.00%)，较市价 Taker (0.05% + 0.02%) 节省 >60% 摩擦
+- 资金费率建模: 永续合约每 8 小时 (00/08/16 UTC 整点) 按名义价值结算一次资金费，默认 0.01%/8h（多头付费、空头收取），已计入逐笔净盈亏
+- 强平风险建模: 按逐仓保证金与维持保证金率推算强平价，K 线穿越强平价即触发强平，损失全部保证金（而非仅按止损价平仓）
+- 震荡/路径效率过滤 (Regime Guard): 入场需同时满足 |EMA144-EMA288| >= 1.25*ATR 且顺势方向 24h 漂移 t 值 >= 0.2，剔除均线缠绕的震荡区间；配套平仓后同标的冷却期与单日回撤熔断，避免震荡期重复扫损
 - 激进双引擎策略:
   ① 顺势双向波段引擎 (Trend Swing Engine - 双向顺势):
      - 牛市多头分支 (Bull Branch): 宏观 12h/24h 上行趋势 (EMA144 > EMA288 且收盘在 EMA144 之上)，
@@ -55,9 +58,25 @@ class Position:
     entry_reason: str
     peak: float
     trough: float
+    liq_price: float = 0.0
+    next_funding_dt: Optional[pd.Timestamp] = None
+    funding_paid: float = 0.0
 
-def load_and_align_candles(period: str = '1year'):
-    if period == '1year':
+def next_funding_time(ts: pd.Timestamp, interval_hours: int = 8) -> pd.Timestamp:
+    """返回严格晚于 ts 的下一个资金费结算时刻（默认 00/08/16 UTC 整点）"""
+    day = pd.Timestamp(ts).normalize()
+    for h in range(0, 24, interval_hours):
+        t = day + pd.Timedelta(hours=h)
+        if t > ts:
+            return t
+    return day + pd.Timedelta(days=1)
+
+def load_and_align_candles(period: str = 'prev_year'):
+    if period == '2years':
+        pattern = '{s}_5m_2years.csv'
+    elif period == 'prev_year':
+        pattern = '{s}_5m_prev_year.csv'
+    elif period == '1year':
         pattern = '{s}_5m_1year.csv'
     elif period == '6months':
         pattern = '{s}_5m_6months.csv'
@@ -140,7 +159,17 @@ def run_human_trading_simulation(
     swing_trail_pb: float = 0.005, # 从最高/最低回撤 0.5% 止盈
     max_hold_bars: int = 288, # 24 小时 (1天内)
     fee_rate: Optional[float] = None,
-    slippage: Optional[float] = None
+    slippage: Optional[float] = None,
+    funding_rate: float = 0.0001, # 每 8 小时资金费率（正=多头付空头）
+    funding_interval_hours: int = 8,
+    maintenance_margin_rate: float = 0.005, # 维持保证金率（用于推算强平价）
+    # --- 震荡/路径效率过滤 (Regime Guard): 与波段逻辑兼容的低侵入过滤器 ---
+    regime_filter: bool = True,          # 是否启用震荡状态过滤
+    min_trend_spread_atr: float = 1.25,  # |EMA144-EMA288| >= k*ATR，剔除均线缠绕
+    min_trend_t: float = 0.2,            # 顺势方向 24h 漂移 t 值下限（趋势显著性）
+    trend_t_window: int = 288,           # 漂移 t 值回看窗口（288 根 5m = 24h）
+    cooldown_bars: int = 12,             # 平仓后同标的冷却 K 线数（12 根 = 1h），震荡期抑制重复扫损
+    daily_loss_limit: float = 0.02       # 单日权益回撤熔断阈值（0.02 = 2%，0 表示关闭）
 ):
     if execution == 'taker':
         fee_rate = 0.0005 if fee_rate is None else fee_rate # OKX Taker 0.05%
@@ -157,6 +186,9 @@ def run_human_trading_simulation(
     completed_trades = []
     equity_curve = []
     trade_id_counter = 1
+    last_exit_bar: Dict[str, int] = {}  # 同标的平仓冷却跟踪
+    day_key = None
+    day_start_equity = initial_capital  # 日内熔断基准（当日首根 K 线盯市权益）
     
     start_bar = 288 # 预热 288 根 K 线确保所有 EMA 与指标完全收敛
     
@@ -171,18 +203,25 @@ def run_human_trading_simulation(
             c = sd['c'][i]
             h = sd['h'][i]
             l = sd['l'][i]
-            rsi3 = sd['rsi3'][i]
             hold_bars = i - pos.entry_bar + 1
             hold_mins = hold_bars * 5
+
+            # 资金费率结算: 每 8 小时整点按名义价值结算 (多头付、空头收)
+            while pos.next_funding_dt is not None and pos.next_funding_dt <= curr_dt:
+                funding_cost = pos.nominal_size * funding_rate
+                pos.funding_paid += funding_cost if pos.side == 'LONG' else -funding_cost
+                pos.next_funding_dt = pos.next_funding_dt + pd.Timedelta(hours=funding_interval_hours)
             
             exit_price = None
             exit_reason = ""
+            liquidated = False
             
             if pos.side == 'LONG':
+                liq_hit = (l <= pos.liq_price)
                 sl_hit = (l <= pos.stop_loss)
                 tp_hit = (h >= pos.take_profit)
                 
-                if pos.mode == 'SWING':
+                if pos.mode == 'SWING': # CLIMAX 已停用，此处仅保留 SWING 分支
                     # 时序因果追踪止损 (Causal Trailing Stop)
                     # 1. 若此前 K 线已达激活点，当前 K 线的 low <= trail_px 即触发出场
                     prior_peak = pos.peak
@@ -202,7 +241,11 @@ def run_human_trading_simulation(
                                 trail_hit = True
                                 trail_exit = max(trail_px, pos.stop_loss)
                                 
-                    if tp_hit and not sl_hit:
+                    if liq_hit:
+                        liquidated = True
+                        exit_price = pos.liq_price
+                        exit_reason = f"LIQUIDATION (强平 {pos.liq_price:.4f})"
+                    elif tp_hit and not sl_hit:
                         exit_price = pos.take_profit
                         exit_reason = f"TP_TARGET (+{pos.tp_pct*100:.1f}%)"
                     elif trail_hit:
@@ -215,19 +258,8 @@ def run_human_trading_simulation(
                     elif hold_bars >= max_hold_bars:
                         exit_price = c * (1.0 - slippage)
                         exit_reason = f"TIME_LIMIT_1D ({hold_mins}m)"
-                else: # CLIMAX
-                    if tp_hit and not sl_hit:
-                        exit_price = pos.take_profit
-                        exit_reason = f"TP_TARGET (+{pos.tp_pct*100:.1f}%)"
-                    elif sl_hit:
-                        exit_price = pos.stop_loss * (1.0 - slippage)
-                        exit_reason = f"SL_ATR ({scalp_sl_mult:.1f}*ATR)"
-                    elif rsi3 >= scalp_exit_rsi:
-                        exit_price = c * (1.0 - slippage)
-                        exit_reason = f"TP_RSI_REVERT (RSI>={scalp_exit_rsi:.0f})"
-                    elif hold_bars >= max_hold_bars:
-                        exit_price = c * (1.0 - slippage)
-                        exit_reason = f"TIME_LIMIT_1D ({hold_mins}m)"
+                # CLIMAX 分支已删除: 策略纯化后仅保留 SWING 顺势波段引擎
+
                         
                 if exit_price is not None:
                     gross_pnl = (exit_price - pos.entry_price) * pos.quantity
@@ -235,15 +267,20 @@ def run_human_trading_simulation(
                     exit_nominal = exit_price * pos.quantity
                     exit_fee = exit_nominal * fee_rate
                     total_fees = round(entry_fee + exit_fee, 2)
-                    net_pnl = round(gross_pnl - total_fees, 2)
+                    if liquidated:
+                        # 强平：损失全部保证金
+                        net_pnl = -round(pos.margin, 2)
+                    else:
+                        net_pnl = round(gross_pnl - total_fees - pos.funding_paid, 2)
                     
                     cash += (pos.margin + net_pnl)
                     del active_positions[sym]
+                    last_exit_bar[sym] = i  # 开始同标的冷却期
                     
                     # 动态逐笔结算后权益
                     unrealized_rem = sum(
-                        (data[s]['c'][i] - p.entry_price) * p.quantity if p.side == 'LONG'
-                        else (p.entry_price - data[s]['c'][i]) * p.quantity
+                        ((data[s]['c'][i] - p.entry_price) * p.quantity if p.side == 'LONG'
+                        else (p.entry_price - data[s]['c'][i]) * p.quantity) - p.funding_paid
                         for s, p in active_positions.items()
                     )
                     total_equity = round(cash + sum(p.margin for p in active_positions.values()) + unrealized_rem, 2)
@@ -270,6 +307,8 @@ def run_human_trading_simulation(
                         'price_ret_pct': round(price_ret * 100.0, 3),
                         'net_pnl': net_pnl,
                         'roe_pct': roe_pct,
+                        'funding_paid': round(pos.funding_paid, 2),
+                        'liq_price': round(pos.liq_price, 4),
                         'account_equity': total_equity,
                         'exit_reason': exit_reason,
                         'entry_reason': pos.entry_reason
@@ -279,6 +318,7 @@ def run_human_trading_simulation(
                     if l < pos.trough: pos.trough = l
                     
             elif pos.side == 'SHORT':
+                liq_hit = (h >= pos.liq_price)
                 sl_hit = (h >= pos.stop_loss)
                 tp_hit = (l <= pos.take_profit)
                 
@@ -302,7 +342,11 @@ def run_human_trading_simulation(
                                 trail_hit = True
                                 trail_exit = min(trail_px, pos.stop_loss)
                                 
-                    if tp_hit and not sl_hit:
+                    if liq_hit:
+                        liquidated = True
+                        exit_price = pos.liq_price
+                        exit_reason = f"LIQUIDATION (强平 {pos.liq_price:.4f})"
+                    elif tp_hit and not sl_hit:
                         exit_price = pos.take_profit
                         exit_reason = f"TP_TARGET (+{pos.tp_pct*100:.1f}%)"
                     elif trail_hit:
@@ -315,19 +359,8 @@ def run_human_trading_simulation(
                     elif hold_bars >= max_hold_bars:
                         exit_price = c * (1.0 + slippage)
                         exit_reason = f"TIME_LIMIT_1D ({hold_mins}m)"
-                else: # CLIMAX
-                    if tp_hit and not sl_hit:
-                        exit_price = pos.take_profit
-                        exit_reason = f"TP_TARGET (+{pos.tp_pct*100:.1f}%)"
-                    elif sl_hit:
-                        exit_price = pos.stop_loss * (1.0 + slippage)
-                        exit_reason = f"SL_ATR ({scalp_sl_mult:.1f}*ATR)"
-                    elif rsi3 <= (100.0 - scalp_exit_rsi):
-                        exit_price = c * (1.0 + slippage)
-                        exit_reason = f"TP_RSI_REVERT (RSI<={100-scalp_exit_rsi:.0f})"
-                    elif hold_bars >= max_hold_bars:
-                        exit_price = c * (1.0 + slippage)
-                        exit_reason = f"TIME_LIMIT_1D ({hold_mins}m)"
+                # CLIMAX 分支已删除: 策略纯化后仅保留 SWING 顺势波段引擎
+
                         
                 if exit_price is not None:
                     gross_pnl = (pos.entry_price - exit_price) * pos.quantity
@@ -335,14 +368,19 @@ def run_human_trading_simulation(
                     exit_nominal = exit_price * pos.quantity
                     exit_fee = exit_nominal * fee_rate
                     total_fees = round(entry_fee + exit_fee, 2)
-                    net_pnl = round(gross_pnl - total_fees, 2)
+                    if liquidated:
+                        # 强平：损失全部保证金
+                        net_pnl = -round(pos.margin, 2)
+                    else:
+                        net_pnl = round(gross_pnl - total_fees - pos.funding_paid, 2)
                     
                     cash += (pos.margin + net_pnl)
                     del active_positions[sym]
+                    last_exit_bar[sym] = i  # 开始同标的冷却期
                     
                     unrealized_rem = sum(
-                        (data[s]['c'][i] - p.entry_price) * p.quantity if p.side == 'LONG'
-                        else (p.entry_price - data[s]['c'][i]) * p.quantity
+                        ((data[s]['c'][i] - p.entry_price) * p.quantity if p.side == 'LONG'
+                        else (p.entry_price - data[s]['c'][i]) * p.quantity) - p.funding_paid
                         for s, p in active_positions.items()
                     )
                     total_equity = round(cash + sum(p.margin for p in active_positions.values()) + unrealized_rem, 2)
@@ -369,6 +407,8 @@ def run_human_trading_simulation(
                         'price_ret_pct': round(price_ret * 100.0, 3),
                         'net_pnl': net_pnl,
                         'roe_pct': roe_pct,
+                        'funding_paid': round(pos.funding_paid, 2),
+                        'liq_price': round(pos.liq_price, 4),
                         'account_equity': total_equity,
                         'exit_reason': exit_reason,
                         'entry_reason': pos.entry_reason
@@ -379,8 +419,8 @@ def run_human_trading_simulation(
 
         # 记录当前时间步动态盯市总资产 (Mark-to-Market Equity)
         unrealized_total = sum(
-            (data[s]['c'][i] - p.entry_price) * p.quantity if p.side == 'LONG'
-            else (p.entry_price - data[s]['c'][i]) * p.quantity
+            ((data[s]['c'][i] - p.entry_price) * p.quantity if p.side == 'LONG'
+            else (p.entry_price - data[s]['c'][i]) * p.quantity) - p.funding_paid
             for s, p in active_positions.items()
         )
         current_mtm_equity = round(cash + sum(p.margin for p in active_positions.values()) + unrealized_total, 2)
@@ -390,6 +430,12 @@ def run_human_trading_simulation(
             'cash': round(cash, 2),
             'active_positions': len(active_positions)
         })
+
+        # 日内熔断基准: 每个自然日首根 K 线重置为该日盯市权益
+        bar_day = pd.Timestamp(curr_dt).date()
+        if bar_day != day_key:
+            day_key = bar_day
+            day_start_equity = current_mtm_equity
         
         # --- 步骤 2: 严格根据第 i 根 K 线收盘指标评估新开仓信号 ---
         if len(active_positions) < max_positions and cash > 500:
@@ -404,7 +450,6 @@ def run_human_trading_simulation(
                 o_i = sd['o'][i]
                 h_i = sd['h'][i]
                 l_i = sd['l'][i]
-                rsi3_i = sd['rsi3'][i]
                 rsi9_i = sd['rsi9'][i]
                 macd_h = sd['macd_hist'][i]
                 atr_i = sd['atr14'][i]
@@ -452,7 +497,26 @@ def run_human_trading_simulation(
                     tp_val = swing_tp
                     sl_mult = swing_sl_mult
                         
+                # --- 震荡/路径效率过滤 (Regime Guard) ---
+                # 1) 趋势带宽度: |EMA144-EMA288| 需显著拉开 (剔除均线缠绕的震荡区间)
+                # 2) 趋势显著性: 顺势方向 24h 漂移 t 值需为正且显著 (横盘中净漂移≈0)
+                # 注意: 两个条件均基于 12h/24h 宏观均线，不会拦截趋势中的正常回踩波段信号
+                if side is not None and regime_filter:
+                    trend_spread_atr = abs(ema144_i - ema288_i) / max(atr_i, 1e-9)
+                    tw = min(trend_t_window, i)
+                    drift = (c_i - sd['c'][i - tw]) / max(atr_i * np.sqrt(tw), 1e-9)
+                    trend_t = drift if side == 'LONG' else -drift
+                    if trend_spread_atr < min_trend_spread_atr or trend_t < min_trend_t:
+                        side = None  # 均线缠绕或趋势漂移不显著 → 放弃该震荡信号
+
                 if side is None:
+                    continue
+
+                # 同标的冷却期: 平仓后一段时间内不再重复进场 (震荡期抑制"扫损-再进-再扫"循环)
+                if cooldown_bars > 0 and (i - last_exit_bar.get(sym, -(10**9))) < cooldown_bars:
+                    continue
+                # 单日权益熔断: 当日盯市权益回撤超过阈值后，当日不再开新仓
+                if daily_loss_limit > 0 and current_mtm_equity <= day_start_equity * (1.0 - daily_loss_limit):
                     continue
                     
                 lev = btc_eth_lev if ('BTC' in sym or 'ETH' in sym) else alt_lev
@@ -471,6 +535,7 @@ def run_human_trading_simulation(
                     qty = nominal / fill_price
                     sl = fill_price - sl_mult * atr_i
                     tp = fill_price * (1.0 + tp_val)
+                    liq = fill_price * (1.0 - 1.0 / lev + maintenance_margin_rate)
                     active_positions[sym] = Position(
                         trade_id=trade_id_counter,
                         symbol=sym,
@@ -488,7 +553,9 @@ def run_human_trading_simulation(
                         tp_pct=tp_val,
                         entry_reason=reason_desc,
                         peak=fill_price,
-                        trough=fill_price
+                        trough=fill_price,
+                        liq_price=liq,
+                        next_funding_dt=next_funding_time(next_dt, funding_interval_hours)
                     )
                     trade_id_counter += 1
                 elif side == 'SHORT':
@@ -496,6 +563,7 @@ def run_human_trading_simulation(
                     qty = nominal / fill_price
                     sl = fill_price + sl_mult * atr_i
                     tp = fill_price * (1.0 - tp_val)
+                    liq = fill_price * (1.0 + 1.0 / lev - maintenance_margin_rate)
                     active_positions[sym] = Position(
                         trade_id=trade_id_counter,
                         symbol=sym,
@@ -513,7 +581,9 @@ def run_human_trading_simulation(
                         tp_pct=tp_val,
                         entry_reason=reason_desc,
                         peak=fill_price,
-                        trough=fill_price
+                        trough=fill_price,
+                        liq_price=liq,
+                        next_funding_dt=next_funding_time(next_dt, funding_interval_hours)
                     )
                     trade_id_counter += 1
 
@@ -537,7 +607,7 @@ def run_human_trading_simulation(
         exit_nominal = exit_price * pos.quantity
         exit_fee = exit_nominal * fee_rate
         total_fees = round(entry_fee + exit_fee, 2)
-        net_pnl = round(gross_pnl - total_fees, 2)
+        net_pnl = round(gross_pnl - total_fees - pos.funding_paid, 2)
         
         cash += (pos.margin + net_pnl)
         del active_positions[sym]
@@ -565,6 +635,8 @@ def run_human_trading_simulation(
             'price_ret_pct': round(price_ret * 100.0, 3),
             'net_pnl': net_pnl,
             'roe_pct': roe_pct,
+            'funding_paid': round(pos.funding_paid, 2),
+            'liq_price': round(pos.liq_price, 4),
             'account_equity': total_equity,
             'exit_reason': "SIMULATION_END",
             'entry_reason': pos.entry_reason
@@ -583,12 +655,26 @@ def run_human_trading_simulation(
     df_equity = pd.DataFrame(equity_curve)
     return final_cash_rounded, df_trades, df_equity
 
-def generate_outputs(period: str = '1year', execution: str = 'maker'):
+def generate_outputs(period: str = '1year', execution: str = 'maker',
+                     funding_rate: float = 0.0001,
+                     maintenance_margin_rate: float = 0.005,
+                     regime_filter: bool = True,
+                     min_trend_spread_atr: float = 1.25,
+                     min_trend_t: float = 0.2,
+                     cooldown_bars: int = 12,
+                     daily_loss_limit: float = 0.02):
     initial_cap = 10000.0
     final_cash, df_trades, df_equity = run_human_trading_simulation(
         period=period,
         execution=execution,
-        initial_capital=initial_cap
+        initial_capital=initial_cap,
+        funding_rate=funding_rate,
+        maintenance_margin_rate=maintenance_margin_rate,
+        regime_filter=regime_filter,
+        min_trend_spread_atr=min_trend_spread_atr,
+        min_trend_t=min_trend_t,
+        cooldown_bars=cooldown_bars,
+        daily_loss_limit=daily_loss_limit
     )
     
     # 1. 保存交易明细 CSV
@@ -597,7 +683,13 @@ def generate_outputs(period: str = '1year', execution: str = 'maker'):
     print(f"[1/4] Saved detailed trades CSV ({len(df_trades)} trades) to {csv_path}")
     
     # 归档文件保存
-    if period == '1year':
+    if period == '2years':
+        suffix = '2y_maker.csv' if execution == 'maker' else '2y.csv'
+        df_trades.to_csv(Path(f"data/okx_human_trades_log_{suffix}"), index=False, encoding='utf-8-sig')
+    elif period == 'prev_year':
+        suffix = 'prev_year_maker.csv' if execution == 'maker' else 'prev_year.csv'
+        df_trades.to_csv(Path(f"data/okx_human_trades_log_{suffix}"), index=False, encoding='utf-8-sig')
+    elif period == '1year':
         suffix = '1y_maker.csv' if execution == 'maker' else '1y.csv'
         df_trades.to_csv(Path(f"data/okx_human_trades_log_{suffix}"), index=False, encoding='utf-8-sig')
     elif period == '6months':
@@ -613,6 +705,7 @@ def generate_outputs(period: str = '1year', execution: str = 'maker'):
     win_rate = (len(wins) / total_trades) * 100.0 if total_trades > 0 else 0.0
     total_net_pnl = df_trades['net_pnl'].sum() if total_trades > 0 else 0.0
     total_fees_paid = df_trades['total_fees'].sum() if total_trades > 0 else 0.0
+    total_funding_paid = df_trades['funding_paid'].sum() if total_trades > 0 else 0.0
     final_equity = df_trades['account_equity'].iloc[-1] if total_trades > 0 else initial_cap
     net_return_pct = ((final_equity - initial_cap) / initial_cap) * 100.0
     
@@ -730,7 +823,7 @@ def generate_outputs(period: str = '1year', execution: str = 'maker'):
         m_wr = (len(m_wins) / len(g)) * 100.0
         m_pnl = g['net_pnl'].sum()
         m_fees = g['total_fees'].sum()
-        m_gross = m_pnl + m_fees
+        m_gross = m_pnl + m_fees + g['funding_paid'].sum()
         monthly_stats.append({
             'month': str(m),
             'trades': len(g),
@@ -747,8 +840,18 @@ def generate_outputs(period: str = '1year', execution: str = 'maker'):
     exit_counts = df_trades['exit_reason'].value_counts()
     
     exec_desc = "OKX 官方 Taker 手续费 0.05% 与实盘滑点 0.02%（双边摩擦共 0.14%）" if execution == 'taker' else "OKX 官方 Maker 手续费 0.02% 与 Post-Only 限价挂单零滑点（双边摩擦共 0.04%）"
-    if period == '1year':
-        period_title = "年度全样本 (1-Year Full Sample)"
+    if period == '2years':
+        period_title = "双年全样本 (2-Year Full Sample)"
+        start_date = df_equity['dt'].iloc[0].strftime('%Y-%m-%d')
+        end_date = df_equity['dt'].iloc[-1].strftime('%Y-%m-%d')
+        date_range_str = f"{start_date} 至 {end_date} (约 730 天 / {len(df_equity):,} 根 5m K线)"
+    elif period == 'prev_year':
+        period_title = "前一年全样本 (2024-2025 Previous Year Sample)"
+        start_date = df_equity['dt'].iloc[0].strftime('%Y-%m-%d')
+        end_date = df_equity['dt'].iloc[-1].strftime('%Y-%m-%d')
+        date_range_str = f"{start_date} 至 {end_date} (约 365 天 / {len(df_equity):,} 根 5m K线)"
+    elif period == '1year':
+        period_title = "近一年全样本 (2025-2026 Recent 1-Year Sample)"
         start_date = df_equity['dt'].iloc[0].strftime('%Y-%m-%d')
         end_date = df_equity['dt'].iloc[-1].strftime('%Y-%m-%d')
         date_range_str = f"{start_date} 至 {end_date} (约 365 天 / {len(df_equity):,} 根 5m K线)"
@@ -762,12 +865,20 @@ def generate_outputs(period: str = '1year', execution: str = 'maker'):
     
     pnl_badge = f"+${total_net_pnl:,.2f} USDT" if total_net_pnl >= 0 else f"-${abs(total_net_pnl):,.2f} USDT"
     ret_desc = (
-        f"扣除所有摩擦后净盈利 +{net_return_pct:.2f}% (全量毛利损益为 +${total_net_pnl + total_fees_paid:,.2f} USDT)"
+        f"扣除所有摩擦（手续费+资金费）后净盈利 +{net_return_pct:.2f}% (全量毛利损益为 +${total_net_pnl + total_fees_paid + total_funding_paid:,.2f} USDT)"
         if total_net_pnl >= 0
-        else f"扣除所有摩擦后净亏损 -{abs(net_return_pct):.2f}% (全量毛利损益为 -${abs(total_net_pnl + total_fees_paid):,.2f} USDT)"
+        else f"扣除所有摩擦（手续费+资金费）后净亏损 -{abs(net_return_pct):.2f}% (全量毛利损益为 -${abs(total_net_pnl + total_fees_paid + total_funding_paid):,.2f} USDT)"
     )
     wr_desc = "双向顺势波段与极值反抽协同运行，把握高期望交易结构" if win_rate >= 50 else "在震荡和逆势假突破行情中受 ATR 保护性止损控制"
-    
+
+    if regime_filter:
+        regime_line = (
+            f"> **震荡状态过滤 (Regime Guard)**: 入场需满足 |EMA144-EMA288| >= {min_trend_spread_atr:.2f}xATR 且顺势方向 24h 漂移 t 值 >= {min_trend_t:.2f}；"
+            f"平仓后同标的冷却 {cooldown_bars} 根 K 线 (约 {cooldown_bars*5/60:.1f}h) 抑制重复扫损；单日权益回撤达 {daily_loss_limit*100:.1f}% 后当日停止开新仓。  \n"
+        )
+    else:
+        regime_line = "> **震荡状态过滤 (Regime Guard)**: 未启用（对照组）。  \n"
+
     md_content = f"""{report_title}
 
 > **测试标的**: OKX 永续合约 10 大主流与高波币种 (`BTC, ETH, SOL, DOGE, XRP, ADA, SUI, LINK, LTC, AVAX`)  
@@ -777,7 +888,9 @@ def generate_outputs(period: str = '1year', execution: str = 'maker'):
 > **双向顺势纯波段架构 (方案 1 纯化落地)**: 移除负期望 CLIMAX 逆势反抽摸顶抄底逻辑，彻底解开回踩买入与 ADX 瞬时指标冲突，全量专注顺势双向波段（EMA144 > EMA288 时逢回踩 1h/3h 均线做多，EMA144 < EMA288 时逢反弹承压做空）。  
 > **挂单执行优化**: 由市价 Taker 转为 Post-Only 限价挂单，手续费降至 0.02% 且实现零滑点，**省下 60%~71% 的摩擦损耗**。  
 > **因果时序与追踪止损**: 彻底消除同根 K 线高低点顺序假设所造成的虚假追踪止盈；平仓时间严格对齐 K 线闭合终点（100% 满足 `exit_time - entry_time == hold_mins`）。  
-> **持仓时间管理**: **严格控制在 1 天以内 (Max Holding <= 24h / 288 Bars)**，实际平均持仓仅 {avg_hold_mins:.1f} 分钟（约 {avg_hold_mins/60:.1f} 小时），最长持仓严格在 1,440 分钟（24.0 小时）以内。
+> **资金费率建模**: 永续合约每 8 小时（00/08/16 UTC）按名义价值结算资金费（默认 0.01%/8h，多头付费、空头收取），已从逐笔净盈亏中扣除。  
+> **强平风险建模**: 按逐仓保证金与 0.5% 维持保证金率推算强平价，K 线穿越强平价按损失全部保证金结算，杜绝高杠杆下的乐观偏差。  
+{regime_line}> **持仓时间管理**: **严格控制在 1 天以内 (Max Holding <= 24h / 288 Bars)**，实际平均持仓仅 {avg_hold_mins:.1f} 分钟（约 {avg_hold_mins/60:.1f} 小时），最长持仓严格在 1,440 分钟（24.0 小时）以内。
 
 ---
 
@@ -797,6 +910,7 @@ def generate_outputs(period: str = '1year', execution: str = 'maker'):
 | **最大单笔亏损** | **-${abs(df_trades['net_pnl'].min()):.2f} USDT** ({df_trades['roe_pct'].min():.1f}% ROE) | < -30% ROE | 严格执行 2.0*ATR 刚性止损，最大单笔亏损距 -95% 爆仓线有 5 倍以上安全垫 |
 | **最大盯市净值回撤 (MTM Max DD)** | **{max_dd_pct:.2f}% (${max_dd_usd:,.2f})** | < 25.0% | 真实反映持仓期间未实现浮亏的动态盯市最大回撤 |
 | **累计手续费与滑点支出** | **${total_fees_paid:,.2f} USDT** | - | {exec_desc} 下摩擦支出占比仅 {total_fees_paid/initial_cap*100:.2f}% |
+| **累计资金费净支出 (Funding)** | **${total_funding_paid:,.2f} USDT** | - | 按名义价值每 8 小时结算 (默认 0.01%/8h，多头付费空头收取；负值=空头收取的净额)，占比 {total_funding_paid/initial_cap*100:.2f}% |
 | **平均持仓周期** | **{avg_hold_mins:.1f} 分钟 ({avg_hold_mins/60:.2f} 小时)** | <= 24.0 小时 | 资金周转极快，绝大部分交易在数小时内平仓释放资金 |
 | **最长单笔持仓** | **{max_hold_mins} 分钟 ({max_hold_mins/60:.1f} 小时)** | **<= 24.0 小时 (1440m)** | **100% 绝对满足“持仓时间1天内”的刚性设计要求** |
 
@@ -863,7 +977,9 @@ def generate_outputs(period: str = '1year', execution: str = 'maker'):
     for reason_val, count_val in exit_counts.items():
         pct_val = (count_val / total_trades) * 100.0
         role_desc = ""
-        if "SL_ATR" in reason_val:
+        if "LIQUIDATION" in reason_val:
+            role_desc = "强平：K 线穿越强平价，保证金全额损失，作为 10-15x 高杠杆下的最后防线"
+        elif "SL_ATR" in reason_val:
             role_desc = "刚性 2.0*ATR 波动率止损，有效阻断极端行情的穿仓风险"
         elif "TRAILING_STOP" in reason_val:
             role_desc = "时序因果追踪止盈：盈利超 1.2% 后回撤 0.5% 自动平仓锁利，核心利润护航机制"
@@ -942,13 +1058,13 @@ def generate_outputs(period: str = '1year', execution: str = 'maker'):
 
 以下为严格按照时间因果推进发生、毫无遗漏的全部 {total_trades} 笔真实交易详细台账：
 
-| # | 交易标的 | 方向 | 模式 | 杠杆 | 开仓时间 (UTC) | 开仓均价 | 平仓时间 (UTC) | 平仓均价 | 持仓时长 | 净盈亏 (USDT) | 本金收益率 | 账户净值 | 平仓理由与离场逻辑 | 开仓信号逻辑 |
+| # | 交易标的 | 方向 | 模式 | 杠杆 | 开仓时间 (UTC) | 开仓均价 | 平仓时间 (UTC) | 平仓均价 | 持仓时长 | 净盈亏 (USDT) | 资金费 (USDT) | 本金收益率 | 账户净值 | 平仓理由与离场逻辑 | 开仓信号逻辑 |
 | :---: | :--- | :---: | :---: | :---: | :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- | :--- |
 """
     for _, r in df_trades.iterrows():
         pnl_badge = f"+${r['net_pnl']:.2f}" if r['net_pnl'] >= 0 else f"-${abs(r['net_pnl']):.2f}"
         roe_badge = f"+{r['roe_pct']:.2f}%" if r['roe_pct'] >= 0 else f"{r['roe_pct']:.2f}%"
-        md_content += f"| {r['trade_id']:03d} | `{r['symbol']}` | **{r['side']}** | {r['mode']} | {r['leverage']} | {r['entry_time']} | {r['entry_price']} | {r['exit_time']} | {r['exit_price']} | {r['hold_mins']}m | **{pnl_badge}** | {roe_badge} | ${r['account_equity']:,.2f} | {r['exit_reason']} | {r['entry_reason']} |\n"
+        md_content += f"| {r['trade_id']:03d} | `{r['symbol']}` | **{r['side']}** | {r['mode']} | {r['leverage']} | {r['entry_time']} | {r['entry_price']} | {r['exit_time']} | {r['exit_price']} | {r['hold_mins']}m | **{pnl_badge}** | {r['funding_paid']:.2f} | {roe_badge} | ${r['account_equity']:,.2f} | {r['exit_reason']} | {r['entry_reason']} |\n"
 
     md_path = Path("data/okx_human_trades_log.md")
     with open(md_path, 'w', encoding='utf-8') as f:
@@ -959,8 +1075,22 @@ def generate_outputs(period: str = '1year', execution: str = 'maker'):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="OKX Pure Trend Swing Trader Simulation")
-    parser.add_argument("--period", choices=["1year", "6months", "last_month"], default="1year", help="Data period to test (default: 1year)")
+    parser.add_argument("--period", choices=["2years", "prev_year", "1year", "6months", "last_month"], default="prev_year", help="Data period to test (default: prev_year)")
     parser.add_argument("--execution", choices=["taker", "maker"], default="maker", help="Execution mode (default: maker)")
+    parser.add_argument("--funding-rate", type=float, default=0.0001, help="Funding rate per 8h (default 0.0001 = 0.01%%, long pays short)")
+    parser.add_argument("--maintenance-margin-rate", type=float, default=0.005, help="Maintenance margin rate for liquidation price (default 0.005)")
+    parser.add_argument("--no-regime-filter", dest="regime_filter", action="store_false", help="Disable chop/regime filter (default: enabled)")
+    parser.add_argument("--min-trend-spread-atr", type=float, default=1.25, help="Min |EMA144-EMA288|/ATR (default: 1.25)")
+    parser.add_argument("--min-trend-t", type=float, default=0.2, help="Min directional 24h drift t-score (default: 0.2)")
+    parser.add_argument("--cooldown-bars", type=int, default=12, help="Per-symbol cooldown bars after exit (default: 12 = 1h)")
+    parser.add_argument("--daily-loss-limit", type=float, default=0.02, help="Daily equity drawdown circuit breaker (default: 0.02, 0=off)")
     args = parser.parse_args()
     print(f"Starting OKX Pure Trend Swing Simulation with period={args.period}, execution={args.execution}...")
-    generate_outputs(period=args.period, execution=args.execution)
+    generate_outputs(period=args.period, execution=args.execution,
+                     funding_rate=args.funding_rate,
+                     maintenance_margin_rate=args.maintenance_margin_rate,
+                     regime_filter=args.regime_filter,
+                     min_trend_spread_atr=args.min_trend_spread_atr,
+                     min_trend_t=args.min_trend_t,
+                     cooldown_bars=args.cooldown_bars,
+                     daily_loss_limit=args.daily_loss_limit)
