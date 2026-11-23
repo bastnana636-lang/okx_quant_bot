@@ -56,8 +56,13 @@ class Position:
     peak: float
     trough: float
 
-def load_and_align_candles(period: str = '6months'):
-    pattern = '{s}_5m_6months.csv' if period == '6months' else '{s}_5m_last_month.csv'
+def load_and_align_candles(period: str = '1year'):
+    if period == '1year':
+        pattern = '{s}_5m_1year.csv'
+    elif period == '6months':
+        pattern = '{s}_5m_6months.csv'
+    else:
+        pattern = '{s}_5m_last_month.csv'
     dfs = {}
     for s in SYMBOLS:
         p = DATA_DIR / pattern.format(s=s)
@@ -121,7 +126,7 @@ def load_and_align_candles(period: str = '6months'):
     return common_ts, market_data
 
 def run_human_trading_simulation(
-    period: str = 'last_month',
+    period: str = '1year',
     execution: str = 'maker',
     initial_capital: float = 10000.0,
     max_positions: int = 3,
@@ -578,7 +583,7 @@ def run_human_trading_simulation(
     df_equity = pd.DataFrame(equity_curve)
     return final_cash_rounded, df_trades, df_equity
 
-def generate_outputs(period: str = 'last_month', execution: str = 'maker'):
+def generate_outputs(period: str = '1year', execution: str = 'maker'):
     initial_cap = 10000.0
     final_cash, df_trades, df_equity = run_human_trading_simulation(
         period=period,
@@ -592,7 +597,10 @@ def generate_outputs(period: str = 'last_month', execution: str = 'maker'):
     print(f"[1/4] Saved detailed trades CSV ({len(df_trades)} trades) to {csv_path}")
     
     # 归档文件保存
-    if period == '6months':
+    if period == '1year':
+        suffix = '1y_maker.csv' if execution == 'maker' else '1y.csv'
+        df_trades.to_csv(Path(f"data/okx_human_trades_log_{suffix}"), index=False, encoding='utf-8-sig')
+    elif period == '6months':
         suffix = '6m_maker.csv' if execution == 'maker' else '6m.csv'
         df_trades.to_csv(Path(f"data/okx_human_trades_log_{suffix}"), index=False, encoding='utf-8-sig')
     elif period == 'last_month' and execution == 'maker':
@@ -739,8 +747,17 @@ def generate_outputs(period: str = 'last_month', execution: str = 'maker'):
     exit_counts = df_trades['exit_reason'].value_counts()
     
     exec_desc = "OKX 官方 Taker 手续费 0.05% 与实盘滑点 0.02%（双边摩擦共 0.14%）" if execution == 'taker' else "OKX 官方 Maker 手续费 0.02% 与 Post-Only 限价挂单零滑点（双边摩擦共 0.04%）"
-    period_title = "半年全样本 (6-Month Full Sample)" if period == '6months' else "单月样本 (1-Month Sample)"
-    date_range_str = "2026-05-27 至 2026-11-23 (约 180 天 / 51,820 根 5m K线)" if period == '6months' else "2026-10-24 至 2026-11-23 (约 30 天 / 8,638 根 5m K线)"
+    if period == '1year':
+        period_title = "年度全样本 (1-Year Full Sample)"
+        start_date = df_equity['dt'].iloc[0].strftime('%Y-%m-%d')
+        end_date = df_equity['dt'].iloc[-1].strftime('%Y-%m-%d')
+        date_range_str = f"{start_date} 至 {end_date} (约 365 天 / {len(df_equity):,} 根 5m K线)"
+    elif period == '6months':
+        period_title = "半年全样本 (6-Month Full Sample)"
+        date_range_str = "2026-05-27 至 2026-11-23 (约 180 天 / 51,820 根 5m K线)"
+    else:
+        period_title = "单月样本 (1-Month Sample)"
+        date_range_str = "2026-10-24 至 2026-11-23 (约 30 天 / 8,638 根 5m K线)"
     report_title = f"# OKX 永续合约真人模拟交易程序{period_title}实录与综合性能评估报告"
     
     pnl_badge = f"+${total_net_pnl:,.2f} USDT" if total_net_pnl >= 0 else f"-${abs(total_net_pnl):,.2f} USDT"
@@ -811,6 +828,11 @@ def generate_outputs(period: str = 'last_month', execution: str = 'maker'):
             regime_desc = "高位宽幅箱体震荡回踩 7.7w，多空博弈胜率有所修复"
         elif '2026-11' in m_str:
             regime_desc = "BTC 单月大跌 -21%，顺势做空波段大放异彩，实现显著正收益"
+        else:
+            if mr['net_pnl'] > 0:
+                regime_desc = f"顺势捕捉多空大波段，实现正收益 (+${mr['net_pnl']:.2f})"
+            else:
+                regime_desc = f"窄幅震荡磨损，受 ATR 保护性止损控制 (-${abs(mr['net_pnl']):.2f})"
             
         md_content += f"| **{m_str}** | {mr['trades']} 笔 | {mr['wins']} 胜 / {mr['losses']} 负 | {mr['win_rate']:.1f}% | **{p_badge}** | {g_badge} | ${mr['fees']:.2f} | {regime_desc} |\n"
 
@@ -937,7 +959,7 @@ def generate_outputs(period: str = 'last_month', execution: str = 'maker'):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="OKX Pure Trend Swing Trader Simulation")
-    parser.add_argument("--period", choices=["6months", "last_month"], default="6months", help="Data period to test (default: 6months)")
+    parser.add_argument("--period", choices=["1year", "6months", "last_month"], default="1year", help="Data period to test (default: 1year)")
     parser.add_argument("--execution", choices=["taker", "maker"], default="maker", help="Execution mode (default: maker)")
     args = parser.parse_args()
     print(f"Starting OKX Pure Trend Swing Simulation with period={args.period}, execution={args.execution}...")
