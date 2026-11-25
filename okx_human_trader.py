@@ -169,7 +169,15 @@ def run_human_trading_simulation(
     min_trend_t: float = 0.2,            # 顺势方向 24h 漂移 t 值下限（趋势显著性）
     trend_t_window: int = 288,           # 漂移 t 值回看窗口（288 根 5m = 24h）
     cooldown_bars: int = 12,             # 平仓后同标的冷却 K 线数（12 根 = 1h），震荡期抑制重复扫损
-    daily_loss_limit: float = 0.02       # 单日权益回撤熔断阈值（0.02 = 2%，0 表示关闭）
+    daily_loss_limit: float = 0.02,      # 单日权益回撤熔断阈值（0.02 = 2%，0 表示关闭）
+    # --- 多头专项治理 (Long-Side Governance) ---
+    long_enabled: bool = True,                     # 方案一: 是否允许开多头（False = 仅做空）
+    long_min_trend_spread_atr: Optional[float] = None,  # 方案二: 多头专用趋势间距下限（None = 与空头相同）
+    long_min_trend_t: Optional[float] = None,           # 方案二: 多头专用漂移 t 下限（None = 与空头相同）
+    long_btc_min_t: Optional[float] = None,        # 方案三: 多头要求 BTC 24h 漂移 t >= 该值（None = 不启用）
+    long_ema_confirm: bool = False,                # 方案四: 多头需 EMA12 上拐且 EMA36 不再下压
+    long_size_ratio: float = 1.0,                  # 方案六: 多头保证金缩放系数
+    long_scoring: bool = False                     # 方案五: 多头 5 分制评分（5=满仓/4=7成/<=3 不做）
 ):
     if execution == 'taker':
         fee_rate = 0.0005 if fee_rate is None else fee_rate # OKX Taker 0.05%
@@ -180,6 +188,14 @@ def run_human_trading_simulation(
 
     common_ts, data = load_and_align_candles(period=period)
     n_bars = len(common_ts)
+
+    # BTC 全局趋势漂移 t 值（用于多头方向确认）
+    btc_t = None
+    if 'BTC-USDT-SWAP' in data:
+        _bc = data['BTC-USDT-SWAP']['c']
+        _ba = data['BTC-USDT-SWAP']['atr14']
+        btc_t = np.full(n_bars, np.nan)
+        btc_t[288:] = (_bc[288:] - _bc[:-288]) / np.maximum(_ba[288:] * np.sqrt(288.0), 1e-9)
     
     cash = initial_capital
     active_positions: Dict[str, Position] = {}
@@ -501,16 +517,41 @@ def run_human_trading_simulation(
                 # 1) 趋势带宽度: |EMA144-EMA288| 需显著拉开 (剔除均线缠绕的震荡区间)
                 # 2) 趋势显著性: 顺势方向 24h 漂移 t 值需为正且显著 (横盘中净漂移≈0)
                 # 注意: 两个条件均基于 12h/24h 宏观均线，不会拦截趋势中的正常回踩波段信号
+                trend_spread_atr = abs(ema144_i - ema288_i) / max(atr_i, 1e-9)
+                tw = min(trend_t_window, i)
+                drift = (c_i - sd['c'][i - tw]) / max(atr_i * np.sqrt(tw), 1e-9)
+                trend_t = drift if side == 'LONG' else -drift
                 if side is not None and regime_filter:
-                    trend_spread_atr = abs(ema144_i - ema288_i) / max(atr_i, 1e-9)
-                    tw = min(trend_t_window, i)
-                    drift = (c_i - sd['c'][i - tw]) / max(atr_i * np.sqrt(tw), 1e-9)
-                    trend_t = drift if side == 'LONG' else -drift
                     if trend_spread_atr < min_trend_spread_atr or trend_t < min_trend_t:
                         side = None  # 均线缠绕或趋势漂移不显著 → 放弃该震荡信号
 
                 if side is None:
                     continue
+
+                # 多头专项过滤/评分。只作用于 LONG，空头继续使用既有规则。
+                long_size_scale = max(0.0, long_size_ratio)
+                if side == 'LONG':
+                    if not long_enabled:
+                        continue
+                    if regime_filter:
+                        long_spread_floor = min_trend_spread_atr if long_min_trend_spread_atr is None else long_min_trend_spread_atr
+                        long_t_floor = min_trend_t if long_min_trend_t is None else long_min_trend_t
+                        if trend_spread_atr < long_spread_floor or trend_t < long_t_floor:
+                            continue
+                    if long_btc_min_t is not None and (btc_t is None or not np.isfinite(btc_t[i]) or btc_t[i] < long_btc_min_t):
+                        continue
+                    if long_ema_confirm and not (sd['ema12'][i] > sd['ema12'][i-3] and sd['ema36'][i] >= sd['ema36'][i-6]):
+                        continue
+                    if long_scoring:
+                        score = 0
+                        score += int(ema144_i > ema288_i)
+                        score += int(abs(ema144_i-ema288_i) / max(atr_i,1e-9) >= max(min_trend_spread_atr,1.25))
+                        score += int(trend_t >= max(min_trend_t,0.2))
+                        score += int(btc_t is not None and np.isfinite(btc_t[i]) and btc_t[i] >= 0.2)
+                        score += int(sd['ema12'][i] > sd['ema12'][i-3])
+                        if score < 4:
+                            continue
+                        long_size_scale *= 1.0 if score == 5 else 0.7
 
                 # 同标的冷却期: 平仓后一段时间内不再重复进场 (震荡期抑制"扫损-再进-再扫"循环)
                 if cooldown_bars > 0 and (i - last_exit_bar.get(sym, -(10**9))) < cooldown_bars:
@@ -521,6 +562,8 @@ def run_human_trading_simulation(
                     
                 lev = btc_eth_lev if ('BTC' in sym or 'ETH' in sym) else alt_lev
                 margin = min(current_mtm_equity * margin_ratio, max_margin_cap)
+                if side == 'LONG':
+                    margin *= long_size_scale
                 if margin > cash:
                     margin = cash * 0.90
                 if margin < 100:
