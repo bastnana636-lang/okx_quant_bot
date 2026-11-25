@@ -1,7 +1,7 @@
 """Single-position mean reversion, retaining the existing pmm_simple entry point."""
 
-from decimal import Decimal
-from typing import Literal, Optional
+from decimal import Decimal, InvalidOperation
+from typing import Literal, Optional, Tuple
 
 from pydantic import Field, field_validator
 
@@ -26,7 +26,7 @@ class PMMSimpleConfig(ControllerConfigBase, MeanReversionSettings):
     connector_name: Literal["okx_perpetual"] = "okx_perpetual"
     trading_pair: str = Field(default="BTC-USDT", pattern=r"^[A-Z0-9]+-USDT$")
     total_amount_quote: Decimal = Field(default=Decimal("50"), gt=0)
-    leverage: int = Field(default=3, ge=1, le=5)
+    leverage: int = Field(default=3, ge=1, le=20)
     position_mode: PositionMode = PositionMode.ONEWAY
     take_profit_quote: Decimal = Field(default=Decimal("0.3"), gt=0)
     fixed_unrealized_tp_quote: Optional[Decimal] = Field(default=None, gt=1)
@@ -61,6 +61,25 @@ class PMMSimpleController(ControllerBase):
         ])
 
     def get_candles_config(self):
+        if self.config.signal_mode == "human_swing":
+            configs = [
+                CandlesConfig(connector=self.config.connector_name, trading_pair=self.config.trading_pair,
+                              interval="5m", max_records=310),
+                CandlesConfig(connector=self.config.connector_name, trading_pair=self.config.trading_pair,
+                              interval="15m", max_records=max(self.config.atr_length + 10, 32)),
+                CandlesConfig(connector=self.config.connector_name, trading_pair=self.config.trading_pair,
+                              interval="1h", max_records=40),
+                CandlesConfig(connector=self.config.connector_name, trading_pair=self.config.trading_pair,
+                              interval="4h", max_records=72),
+            ]
+            if self.config.require_btc_4h and self.config.trading_pair != "BTC-USDT":
+                configs.extend([
+                    CandlesConfig(connector=self.config.connector_name, trading_pair="BTC-USDT",
+                                  interval="1h", max_records=40),
+                    CandlesConfig(connector=self.config.connector_name, trading_pair="BTC-USDT",
+                                  interval="4h", max_records=72),
+                ])
+            return configs
         return [CandlesConfig(
             connector=self.config.connector_name, trading_pair=self.config.trading_pair,
             interval=self.config.candles_interval, max_records=self.config.candle_records,
@@ -74,8 +93,11 @@ class PMMSimpleController(ControllerBase):
                 await self.send_actions(close_actions)
             return
 
-        # A cash target would flatten a trend early. Momentum exits with the ATR trail.
-        fixed_tp_actions = None if self.config.signal_mode == "momentum" else self.fixed_unrealized_tp_actions()
+        # A cash target would flatten a trend early. Momentum / human_swing exit via barriers/trail.
+        fixed_tp_actions = (
+            None if self.config.signal_mode in ("momentum", "human_swing")
+            else self.fixed_unrealized_tp_actions()
+        )
         if fixed_tp_actions is not None:
             if fixed_tp_actions:
                 await self.send_actions(fixed_tp_actions)
@@ -330,6 +352,40 @@ class PMMSimpleController(ControllerBase):
                 return
             mid = Decimal(str(self.market_data_provider.get_price_by_type(
                 self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)))
+            if self.config.signal_mode == "human_swing":
+                from controllers.market_making.human_swing import human_swing_snapshot
+
+                c5 = self.market_data_provider.get_candles_df(
+                    connector_name=self.config.connector_name, trading_pair=self.config.trading_pair,
+                    interval="5m", max_records=310)
+                c15 = self.market_data_provider.get_candles_df(
+                    connector_name=self.config.connector_name, trading_pair=self.config.trading_pair,
+                    interval="15m", max_records=max(self.config.atr_length + 10, 32))
+                c1h = self.market_data_provider.get_candles_df(
+                    connector_name=self.config.connector_name, trading_pair=self.config.trading_pair,
+                    interval="1h", max_records=40)
+                c4h = self.market_data_provider.get_candles_df(
+                    connector_name=self.config.connector_name, trading_pair=self.config.trading_pair,
+                    interval="4h", max_records=72)
+                btc4h = None
+                if self.config.require_btc_4h:
+                    btc4h = (c4h if self.config.trading_pair == "BTC-USDT"
+                             else self.market_data_provider.get_candles_df(
+                                 connector_name=self.config.connector_name, trading_pair="BTC-USDT",
+                                 interval="4h", max_records=72))
+                peer_feeds = self._collect_peer_regime_feeds()
+                self._snapshot = human_swing_snapshot(
+                    c5, c15, c1h, c4h, self.market_data_provider.time(), mid, self.config,
+                    btc_candles_4h=btc4h, peer_feeds=peer_feeds,
+                )
+                snap = self._snapshot
+                self.processed_data.update({
+                    "signal": snap.signal, "reference_price": mid, "rsi9": snap.rsi9,
+                    "atr": snap.atr15, "stop_pct": snap.stop_pct, "er4h": snap.er4h,
+                    "regime_dir": snap.regime_dir, "candle_timestamp": snap.candle_timestamp,
+                    "reason": snap.reason,
+                })
+                return
             candles = self.market_data_provider.get_candles_df(
                 connector_name=self.config.connector_name, trading_pair=self.config.trading_pair,
                 interval=self.config.candles_interval, max_records=self.config.candle_records,
@@ -433,7 +489,68 @@ class PMMSimpleController(ControllerBase):
             return False
         return True
 
+    def _collect_peer_regime_feeds(self):
+        """Collect 1h/4h candle frames across all initialized feeds for cross-sectional breadth."""
+        feeds = getattr(self.market_data_provider, "candles_feeds", {}) or {}
+        prefix = f"{self.config.connector_name}_"
+        by_pair = {}
+        for key, feed in feeds.items():
+            if not key.startswith(prefix):
+                continue
+            rest = key[len(prefix):]
+            if rest.endswith("_1h"):
+                pair = rest[:-3]
+                df = getattr(feed, "candles_df", None)
+                if df is not None and len(df) > 0:
+                    by_pair.setdefault(pair, {})["1h"] = df
+            elif rest.endswith("_4h"):
+                pair = rest[:-3]
+                df = getattr(feed, "candles_df", None)
+                if df is not None and len(df) > 0:
+                    by_pair.setdefault(pair, {})["4h"] = df
+        return {
+            pair: (pair_map["1h"], pair_map["4h"])
+            for pair, pair_map in by_pair.items()
+            if "1h" in pair_map and "4h" in pair_map
+        }
+
+    @staticmethod
+    def _read_decimal_balance(connector, method_name: str, asset: str = "USDT") -> Optional[Decimal]:
+        getter = getattr(connector, method_name, None)
+        if not callable(getter):
+            return None
+        try:
+            raw = getter(asset)
+        except Exception:
+            return None
+        if isinstance(raw, (int, float, Decimal, str)) and not isinstance(raw, bool):
+            try:
+                val = Decimal(str(raw))
+                if val.is_finite():
+                    return val
+            except (InvalidOperation, ValueError):
+                return None
+        return None
+
+    def _resolve_equity_and_margin_cap(self, connector, leverage: int) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        """Return (usable_equity, max_available_notional) accounting for occupied margin."""
+        total = self._read_decimal_balance(connector, "get_balance")
+        avail = self._read_decimal_balance(connector, "get_available_balance")
+        if avail is not None:
+            if avail <= 0:
+                raise ValueError("Insufficient available USDT margin")
+            usable = min(total, avail) if (total is not None and total > 0) else avail
+            max_avail_notional = avail * Decimal("0.90") * Decimal(leverage)
+            return usable, max_avail_notional
+        if total is not None:
+            if total <= 0:
+                raise ValueError("Insufficient USDT balance")
+            return total, None
+        return None, None
+
     def create_actions_proposal(self):
+        if self.config.signal_mode == "human_swing":
+            return self._human_swing_entry()
         if self.config.signal_mode == "momentum":
             return self._momentum_entry()
         if self.config.manual_kill_switch or self._snapshot is None or not self._snapshot.signal:
@@ -443,6 +560,8 @@ class PMMSimpleController(ControllerBase):
         config = self.config
         provider = self.market_data_provider
         try:
+            connector = provider.get_connector(config.connector_name)
+            _, max_avail_notional = self._resolve_equity_and_margin_cap(connector, config.leverage)
             bid = Decimal(str(provider.get_price_by_type(config.connector_name, config.trading_pair, PriceType.BestBid)))
             ask = Decimal(str(provider.get_price_by_type(config.connector_name, config.trading_pair, PriceType.BestAsk)))
             if not bid.is_finite() or not ask.is_finite() or not 0 < bid < ask:
@@ -463,6 +582,8 @@ class PMMSimpleController(ControllerBase):
                 config.min_reward_risk * (barriers.stop_loss + config.round_trip_cost_pct)
             )
             notional = min(config.total_amount_quote, risk_budget)
+            if max_avail_notional is not None:
+                notional = min(notional, max_avail_notional)
             amount = provider.quantize_order_amount(config.connector_name, config.trading_pair,
                                                     notional / price)
             rules = provider.get_trading_rules(config.connector_name, config.trading_pair)
@@ -502,6 +623,8 @@ class PMMSimpleController(ControllerBase):
         config = self.config
         provider = self.market_data_provider
         try:
+            connector = provider.get_connector(config.connector_name)
+            _, max_avail_notional = self._resolve_equity_and_margin_cap(connector, config.leverage)
             bid = Decimal(str(provider.get_price_by_type(config.connector_name, config.trading_pair, PriceType.BestBid)))
             ask = Decimal(str(provider.get_price_by_type(config.connector_name, config.trading_pair, PriceType.BestAsk)))
             if not bid.is_finite() or not ask.is_finite() or not 0 < bid < ask:
@@ -511,6 +634,8 @@ class PMMSimpleController(ControllerBase):
                 raise ValueError("Bid/ask spread too wide")
             stop_pct = self._snapshot.stop_pct
             notional = momentum_notional(config.total_amount_quote, config.risk_frac, stop_pct)
+            if max_avail_notional is not None:
+                notional = min(notional, max_avail_notional)
             amount = provider.quantize_order_amount(config.connector_name, config.trading_pair, notional / ask)
             rules = provider.get_trading_rules(config.connector_name, config.trading_pair)
             min_notional = max(rules.min_notional_size, rules.min_order_value)
@@ -538,11 +663,115 @@ class PMMSimpleController(ControllerBase):
         self.processed_data.update({"reason": "entry_submitted", "stop_loss": stop_pct, "notional": notional})
         return [CreateExecutorAction(controller_id=config.id, executor_config=executor_config)]
 
+    def _human_swing_entry(self):
+        if self.config.manual_kill_switch or self._snapshot is None or not self._snapshot.signal:
+            return []
+        if not self._can_enter():
+            return []
+        from controllers.market_making.human_swing import human_swing_notional
+
+        config = self.config
+        provider = self.market_data_provider
+        connector = provider.get_connector(config.connector_name)
+        is_buy = self._snapshot.signal == 1
+        if is_buy is False and config.long_only:
+            return []
+
+        # Enforce global concurrent position limit across account positions + active orders
+        open_pairs = {
+            getattr(p, "trading_pair", "")
+            for p in getattr(connector, "account_positions", {}).values()
+            if getattr(p, "amount", Decimal("0")) != 0
+        }
+        for order in getattr(connector, "in_flight_orders", {}).values():
+            if not getattr(order, "is_done", True):
+                open_pairs.add(getattr(order, "trading_pair", ""))
+        if len(open_pairs - {config.trading_pair}) >= config.max_positions:
+            self.processed_data["reason"] = "max_concurrent_positions"
+            return []
+
+        try:
+            usable_equity, max_avail_notional = self._resolve_equity_and_margin_cap(connector, config.leverage)
+            bid = Decimal(str(provider.get_price_by_type(config.connector_name, config.trading_pair, PriceType.BestBid)))
+            ask = Decimal(str(provider.get_price_by_type(config.connector_name, config.trading_pair, PriceType.BestAsk)))
+            if not bid.is_finite() or not ask.is_finite() or not 0 < bid < ask:
+                raise ValueError("Invalid order book")
+            mid = (bid + ask) / 2
+            if (ask - bid) / mid > config.max_bid_ask_spread_pct:
+                raise ValueError("Bid/ask spread too wide")
+            raw_price = (min(bid, mid * (1 - config.quote_offset_pct)) if is_buy
+                         else max(ask, mid * (1 + config.quote_offset_pct)))
+            price = provider.quantize_order_price(config.connector_name, config.trading_pair, raw_price)
+            if price <= 0 or (is_buy and price >= ask) or (not is_buy and price <= bid):
+                raise ValueError("Quantized price would cross the book")
+
+            stop_pct = self._snapshot.stop_pct
+            effective_equity = usable_equity if usable_equity is not None else config.total_amount_quote
+            notional = human_swing_notional(
+                cap=config.total_amount_quote,
+                equity=effective_equity,
+                leverage=config.leverage,
+                eff_risk_frac=self._snapshot.eff_risk_frac,
+                stop_pct=stop_pct,
+                margin_ratio=config.margin_ratio,
+                max_margin_cap=config.max_margin_cap,
+            )
+            if max_avail_notional is not None:
+                notional = min(notional, max_avail_notional)
+            amount = provider.quantize_order_amount(config.connector_name, config.trading_pair, notional / price)
+            rules = provider.get_trading_rules(config.connector_name, config.trading_pair)
+            min_notional = max(rules.min_notional_size, rules.min_order_value)
+            if amount <= 0 or amount < rules.min_order_size or amount * price < min_notional:
+                raise ValueError("Budget below exchange minimum order size")
+            if amount * price > notional:
+                raise ValueError("Quantized order exceeds notional budget")
+        except (ValueError, ArithmeticError) as error:
+            self.processed_data["reason"] = str(error)
+            return []
+
+        executor_config = PositionExecutorConfig(
+            timestamp=provider.time(),
+            level_id="buy_0" if is_buy else "sell_0",
+            connector_name=config.connector_name,
+            trading_pair=config.trading_pair,
+            entry_price=price,
+            amount=amount,
+            leverage=config.leverage,
+            side=TradeType.BUY if is_buy else TradeType.SELL,
+            triple_barrier_config=TripleBarrierConfig(
+                take_profit=config.swing_tp_pct,
+                stop_loss=stop_pct,
+                take_profit_quote=None,
+                time_limit=config.time_limit,
+                trailing_stop=TrailingStop(
+                    activation_price=self._snapshot.trail_trig,
+                    trailing_delta=self._snapshot.trail_pb,
+                ),
+                open_order_type=OrderType.LIMIT_MAKER,
+                take_profit_order_type=OrderType.LIMIT,
+                stop_loss_order_type=OrderType.MARKET,
+                time_limit_order_type=OrderType.MARKET,
+            ),
+        )
+        self._last_entry_candle = self._snapshot.candle_timestamp
+        self.processed_data.update({
+            "reason": "entry_submitted",
+            "stop_loss": stop_pct,
+            "notional": notional,
+            "trail_trig": self._snapshot.trail_trig,
+            "trail_pb": self._snapshot.trail_pb,
+        })
+        return [CreateExecutorAction(controller_id=config.id, executor_config=executor_config)]
+
     def get_custom_info(self):
         return {key: str(value) if isinstance(value, Decimal) else value
                 for key, value in self.processed_data.items()}
 
     def to_format_status(self):
+        if self.config.signal_mode == "human_swing":
+            return [f"Human swing | rsi9={self.processed_data.get('rsi9', 'n/a')} | "
+                    f"er4h={self.processed_data.get('er4h', 'n/a')} | "
+                    f"{self.processed_data.get('reason', 'waiting_for_data')}"]
         if self.config.signal_mode == "momentum":
             return [f"Momentum | move={self.processed_data.get('momentum', 'n/a')} | "
                     f"{self.processed_data.get('reason', 'waiting_for_data')}"]

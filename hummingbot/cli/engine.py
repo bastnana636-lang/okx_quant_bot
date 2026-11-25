@@ -101,6 +101,20 @@ async def _collect_strategy_data(hb: HummingbotApplication) -> Optional[Dict[str
     return None
 
 
+def _sanitize_json_keys(value: Any) -> Any:
+    """Convert non-JSON dict keys (such as Enum members like CloseType) to strings recursively."""
+    if isinstance(value, dict):
+        sanitized: Dict[Any, Any] = {}
+        for k, v in value.items():
+            if not isinstance(k, (str, int, float, bool)) and k is not None:
+                k = k.name if hasattr(k, "name") else str(k)
+            sanitized[k] = _sanitize_json_keys(v)
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json_keys(item) for item in value]
+    return value
+
+
 async def _write_snapshot(hb: HummingbotApplication, name: str, *, running: bool) -> None:
     snapshot: Dict[str, Any] = {
         "name": name,
@@ -117,7 +131,7 @@ async def _write_snapshot(hb: HummingbotApplication, name: str, *, running: bool
         snapshot["balances"] = await _collect_balances(hb)
         snapshot["account_positions"] = await _collect_positions(hb)
         snapshot["strategy_data"] = await _collect_strategy_data(hb)
-    bot.write_status(snapshot)
+    bot.write_status(_sanitize_json_keys(snapshot))
 
 
 async def _serve(hb: HummingbotApplication, name: str) -> None:

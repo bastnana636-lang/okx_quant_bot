@@ -99,12 +99,22 @@ class OkxPerpetualUserStreamDataSource(UserStreamTrackerDataSource):
         payload = {"op": "login", "args": auth_args}
         login_request: WSJSONRequest = WSJSONRequest(payload=payload)
         await ws.send(login_request)
-        response: WSResponse = await ws.receive()
-        message = response.data
 
-        if message["event"] != "login":
+        # Skip advisory OKX notice frames (e.g. port deprecation notices) before login ACK.
+        message = None
+        for _ in range(5):
+            response: WSResponse = await ws.receive()
+            message = response.data if response is not None else None
+            if isinstance(message, dict) and message.get("event") == "notice":
+                self.logger().info(f"OKX private websocket notice ({message.get('code')}): {message.get('msg')}")
+                continue
+            break
+
+        if not isinstance(message, dict) or message.get("event") != "login":
+            code = message.get("code") if isinstance(message, dict) else None
+            msg = message.get("msg") if isinstance(message, dict) else repr(message)
             self.logger().error("Error authenticating the private websocket connection")
-            raise IOError("Private websocket connection authentication failed")
+            raise IOError(f"Private websocket connection authentication failed (code={code}, msg={msg})")
 
     async def _subscribe_to_channels(self, ws: WSAssistant, url: str):
         try:

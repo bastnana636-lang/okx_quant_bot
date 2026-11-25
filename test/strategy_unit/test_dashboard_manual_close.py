@@ -86,44 +86,37 @@ def test_zero_pnl_still_removes_open_unrealized(tmp_path, monkeypatch):
     assert zec["global"] == 0
 
 
-def test_manual_close_dialog_stays_closed_until_opened(monkeypatch):
-    monkeypatch.setattr(view, "build_view", lambda status: {
-        "updated_at": 0,
-        "uptime_s": 0,
-        "stale": False,
-        "strategy": "test",
-        "status_html": "",
-        "snapshot_badge_html": "",
-        "usdt_bal": "0.00",
-        "bot_session_pnl_html": "+0.0000",
-        "bot_session_pnl_cls": "zero",
-        "global_pnl_html": "+0.0000",
-        "global_pnl_cls": "zero",
-        "realized_html": "+0.0000",
-        "realized_cls": "zero",
-        "unrealized_html": "+0.0000",
-        "unrealized_cls": "zero",
-        "stale_html": "",
-        "perf_html": "",
-        "pos_html": "",
-        "manual_close_note": "",
-        "ord_html": "",
-        "exec_html": "",
-        "log_html": "",
-    })
-    monkeypatch.setattr(view, "markets_view", lambda status: {"markets_html": "", "markets_meta": ""})
-    monkeypatch.setattr(view, "render_config_body", lambda: "")
-    monkeypatch.setattr(view, "get_strategy_info", lambda: {"name": "test", "badge": "TEST"})
+def test_spa_serves_built_frontend_and_blocks_traversal():
+    import io
 
-    html = view.render_html({"updated_at": 0}, "dashboard")
+    class DummyGetHandler(view.Handler):
+        def __init__(self, path):
+            self.path = path
+            self.client_address = ("127.0.0.1", 12345)
+            self.headers = {}
+            self.wfile = io.BytesIO()
+            self.responses = []
+            self.sent_headers = []
 
-    assert 'id="manual-close-dialog" class="modal-backdrop" hidden' in html
-    assert ".modal-backdrop[hidden]" in html
-    assert "display: none !important" in html
-    assert ".modal-backdrop.is-open:not([hidden])" in html
-    assert "dialog.classList.add('is-open')" in html
-    assert "target.closest('.manual-close')" in html
-    assert 'onclick="closeDialog()"' in html
+        def send_response(self, code, message=None):
+            self.responses.append(code)
+
+        def send_header(self, keyword, value):
+            self.sent_headers.append((keyword, value))
+
+        def end_headers(self):
+            pass
+
+    h_root = DummyGetHandler("/")
+    h_root.do_GET()
+    assert h_root.responses[0] == 200
+    body = h_root.wfile.getvalue().decode("utf-8")
+    assert "OKX QUANT" in body
+    assert '<div id="root"></div>' in body
+
+    h_trav = DummyGetHandler("/assets/../../strategy_config.py")
+    h_trav.do_GET()
+    assert h_trav.responses[0] == 404
 
 
 def test_session_metrics_resets_realized_and_sums_global_pnl():

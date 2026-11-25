@@ -264,41 +264,89 @@ def test_every_local_config_loads_and_only_uses_new_parameters(policy):
 def test_active_configs_use_scaled_notional_and_cash_take_profit(policy):
     script = yaml.safe_load((ROOT / 'conf/scripts/conf_okx_multi.yml').read_text())
     expected = {
-        'conf_okx_pmm_btc.yml': D('320'),
-        'conf_okx_pmm_eth.yml': D('320'),
-        'conf_okx_pmm_sol.yml': D('200'),
-        'conf_okx_pmm_xrp.yml': D('200'),
-        'conf_okx_pmm_doge.yml': D('200'),
-        'conf_okx_pmm_sui.yml': D('200'),
-        'conf_okx_pmm_sndk.yml': D('200'),
-        'conf_okx_pmm_zec.yml': D('200'),
-        'conf_okx_pmm_okb.yml': D('200'),
-        'conf_okx_pmm_ada.yml': D('200'),
+        'conf_okx_pmm_btc.yml': (15, D('37500')),
+        'conf_okx_pmm_eth.yml': (15, D('37500')),
+        'conf_okx_pmm_sol.yml': (10, D('25000')),
+        'conf_okx_pmm_doge.yml': (10, D('25000')),
+        'conf_okx_pmm_xrp.yml': (10, D('25000')),
+        'conf_okx_pmm_ada.yml': (10, D('25000')),
+        'conf_okx_pmm_sui.yml': (10, D('25000')),
+        'conf_okx_pmm_link.yml': (10, D('25000')),
+        'conf_okx_pmm_ltc.yml': (10, D('25000')),
+        'conf_okx_pmm_avax.yml': (10, D('25000')),
+        'conf_okx_pmm_zec.yml': (10, D('25000')),
     }
     assert set(script['controllers_config']) == set(expected)
-    for name, amount in expected.items():
+    for name, (lev, cap) in expected.items():
         runtime = policy.PMMSimpleConfig(**yaml.safe_load((ROOT / 'conf/controllers' / name).read_text()))
-        template = policy.PMMSimpleConfig(**yaml.safe_load(
-            (ROOT / 'strategy_configs/okx_mean_reversion' / name).read_text()))
-        assert template.total_amount_quote == amount
-        assert template.take_profit_quote == D('2')
-        assert runtime.total_amount_quote in (amount, D('80'), D('50'))
-        assert runtime.take_profit_quote in (D('1'), D('1.2'), D('2'))
-        assert runtime.signal_mode == 'momentum'
-        assert runtime.long_only is True
-        assert runtime.candles_interval == '1h'
-        assert runtime.momentum_lookback == 16
-        assert runtime.momentum_threshold == D('0.008')
-        assert runtime.atr_stop_multiplier == D('3')
-        assert runtime.risk_frac == D('0.02')
-        assert runtime.min_stop_loss == D('0.004')
-        assert runtime.max_stop_loss == D('0.06')
+        assert runtime.leverage == lev
+        assert runtime.total_amount_quote == cap
+        assert runtime.signal_mode == 'human_swing'
+        assert runtime.long_only is False
+        assert runtime.candles_interval == '5m'
+        assert runtime.atr_stop_multiplier == D('2.0')
+        assert runtime.min_stop_loss == D('0.008')
+        assert runtime.risk_frac == D('0.015')
+        assert runtime.swing_tp_pct == D('0.045')
+        assert runtime.adaptive_trail is True
+        assert runtime.require_btc_4h is True
+        assert runtime.min_breadth_frac == D('0.60')
         assert runtime.cooldown_time == 3600
-        assert runtime.time_limit == 604800
+        assert runtime.time_limit == 86400
         assert runtime.fixed_unrealized_tp_quote is None
-        assert template.signal_mode == 'momentum'
-        assert template.momentum_lookback == 16
-        assert template.risk_frac == D('0.02')
+
+
+def test_human_swing_bidirectional_entry_and_sizing(policy):
+    from controllers.market_making.human_swing import HumanSwingSnapshot, human_swing_notional
+
+    # Equal-risk sizing checks: on 10,000 equity, 1.5% risk at 1.5% stop = 10,000 notional
+    assert human_swing_notional(
+        cap=D('37500'), equity=D('10000'), leverage=15, eff_risk_frac=D('0.015'),
+        stop_pct=D('0.015'), margin_ratio=D('0.20'), max_margin_cap=D('2500'),
+    ) == D('10000')
+    # On small 336 equity at 10x, capped by 20% margin = 67.2 * 10 = 672, risk-sized at 0.015/0.015 = 336
+    assert human_swing_notional(
+        cap=D('25000'), equity=D('336'), leverage=10, eff_risk_frac=D('0.015'),
+        stop_pct=D('0.015'), margin_ratio=D('0.20'), max_margin_cap=D('2500'),
+    ) == D('336')
+
+    provider = MagicMock()
+    provider.time.return_value = 1800000000
+    provider.ready = True
+    connector = provider.get_connector.return_value
+    connector.account_positions = {}
+    connector.in_flight_orders = {}
+    connector.get_leverage.return_value = 10
+    connector.get_balance.return_value = D('1000')
+    provider.get_price_by_type.side_effect = lambda c, p, kind: {
+        PriceType.BestBid: D('99.95'), PriceType.BestAsk: D('100.05'), PriceType.MidPrice: D('100.00'),
+    }[kind]
+    provider.quantize_order_price.side_effect = lambda c, p, v: v.quantize(D('.01'))
+    provider.quantize_order_amount.side_effect = lambda c, p, v: v.quantize(D('.01'), rounding=ROUND_DOWN)
+    provider.get_trading_rules.return_value = SimpleNamespace(
+        min_order_size=D('.01'), min_notional_size=D('1'), min_order_value=D('0'))
+
+    config = policy.PMMSimpleConfig(
+        id='test_human', trading_pair='ZEC-USDT', total_amount_quote='25000', leverage=10,
+        signal_mode='human_swing', long_only=False, risk_frac='0.015', swing_tp_pct='0.045',
+        cooldown_time=3600, stop_loss_cooldown_time=3600, time_limit=86400, executor_refresh_time=300,
+    )
+    controller = policy.PMMSimpleController(config, provider)
+    controller._snapshot = HumanSwingSnapshot(
+        candle_timestamp=1799999700, signal=-1, stop_pct=D('0.015'),
+        trail_trig=D('0.015'), trail_pb=D('0.0056'), atr15=D('0.75'),
+        rsi9=D('58.5'), er4h=D('0.35'), eff_risk_frac=D('0.015'),
+        regime_dir=-1, reason='human_swing_short',
+    )
+    actions = controller.create_actions_proposal()
+    assert len(actions) == 1
+    ex = actions[0].executor_config
+    assert ex.side == TradeType.SELL
+    assert ex.triple_barrier_config.open_order_type == OrderType.LIMIT_MAKER
+    assert ex.triple_barrier_config.take_profit == D('0.045')
+    assert ex.triple_barrier_config.stop_loss == D('0.015')
+    assert ex.triple_barrier_config.trailing_stop.activation_price == D('0.015')
+    assert ex.triple_barrier_config.trailing_stop.trailing_delta == D('0.0056')
 
 
 def test_momentum_entry_is_a_market_buy_without_a_cash_target(policy):
@@ -447,5 +495,62 @@ def test_fixed_unrealized_tp_quote_does_not_affect_entry_proposal(controller, po
     assert len(actions_with_tp) == 1
     assert actions_with_tp[0].executor_config.amount == amount_none
     assert actions_with_tp[0].executor_config.side == actions_none[0].executor_config.side
+
+
+def test_human_swing_respects_occupied_margin_available_balance(policy):
+    from controllers.market_making.human_swing import HumanSwingSnapshot
+
+    provider = MagicMock()
+    provider.time.return_value = 1800000000
+    provider.ready = True
+    connector = provider.get_connector.return_value
+    connector.account_positions = {}
+    connector.in_flight_orders = {}
+    connector.get_leverage.return_value = 10
+    connector.get_balance.return_value = D("372.36")
+    connector.get_available_balance.return_value = D("30.00")
+    provider.get_price_by_type.side_effect = lambda c, p, kind: {
+        PriceType.BestBid: D("99.95"), PriceType.BestAsk: D("100.05"), PriceType.MidPrice: D("100.00"),
+    }[kind]
+    provider.quantize_order_price.side_effect = lambda c, p, v: v.quantize(D(".01"))
+    provider.quantize_order_amount.side_effect = lambda c, p, v: v.quantize(D(".01"), rounding=ROUND_DOWN)
+    provider.get_trading_rules.return_value = SimpleNamespace(
+        min_order_size=D(".01"), min_notional_size=D("1"), min_order_value=D("0"))
+
+    config = policy.PMMSimpleConfig(
+        id="test_occ", trading_pair="ZEC-USDT", total_amount_quote="25000", leverage=10,
+        signal_mode="human_swing", long_only=False, risk_frac="0.015", swing_tp_pct="0.045",
+        cooldown_time=3600, stop_loss_cooldown_time=3600, time_limit=86400, executor_refresh_time=300,
+    )
+    controller = policy.PMMSimpleController(config, provider)
+    controller._snapshot = HumanSwingSnapshot(
+        candle_timestamp=1799999700, signal=-1, stop_pct=D("0.015"),
+        trail_trig=D("0.015"), trail_pb=D("0.0056"), atr15=D("0.75"),
+        rsi9=D("58.5"), er4h=D("0.35"), eff_risk_frac=D("0.015"),
+        regime_dir=-1, reason="human_swing_short",
+    )
+    actions = controller.create_actions_proposal()
+    assert len(actions) == 1
+    notional = actions[0].executor_config.amount * actions[0].executor_config.entry_price
+    assert D("25") <= notional <= D("30.5")
+
+    # Zero free balance must block entry rather than falling back to total_amount_quote (25000)
+    controller._last_entry_candle = None
+    connector.get_available_balance.return_value = D("0")
+    assert controller.create_actions_proposal() == []
+    assert controller.processed_data["reason"] == "Insufficient available USDT margin"
+
+
+def test_reversion_caps_notional_by_available_margin(controller):
+    connector = controller.market_data_provider.get_connector.return_value
+    connector.get_balance.return_value = D("372.36")
+    connector.get_available_balance.return_value = D("3.0")
+    connector.get_leverage.return_value = 3
+    actions = controller.create_actions_proposal()
+    assert len(actions) == 1
+    notional = actions[0].executor_config.amount * actions[0].executor_config.entry_price
+    # Must stay within 90% of available balance * leverage = 8.1 USDT (below uncapped 24 USDT)
+    assert D("1") <= notional <= D("8.1")
+
 
 

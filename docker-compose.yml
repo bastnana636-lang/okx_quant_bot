@@ -37,9 +37,16 @@ services:
       # File mounts retain the image's other strategies while loading our local implementation.
       - ./controllers/market_making/pmm_simple.py:/home/hummingbot/controllers/market_making/pmm_simple.py:ro
       - ./controllers/market_making/mean_reversion.py:/home/hummingbot/controllers/market_making/mean_reversion.py:ro
+      - ./controllers/market_making/momentum.py:/home/hummingbot/controllers/market_making/momentum.py:ro
+      - ./controllers/market_making/human_swing.py:/home/hummingbot/controllers/market_making/human_swing.py:ro
+      - ./regime_engine.py:/home/hummingbot/regime_engine.py:ro
       - ./scripts/validate_mean_reversion.py:/home/hummingbot/scripts/validate_mean_reversion.py:ro
+      - ./hummingbot/connector/derivative/okx_perpetual/okx_perpetual_constants.py:/home/hummingbot/hummingbot/connector/derivative/okx_perpetual/okx_perpetual_constants.py:ro
+      - ./hummingbot/connector/derivative/okx_perpetual/okx_perpetual_web_utils.py:/home/hummingbot/hummingbot/connector/derivative/okx_perpetual/okx_perpetual_web_utils.py:ro
       - ./hummingbot/connector/derivative/okx_perpetual/okx_perpetual_user_stream_data_source.py:/home/hummingbot/hummingbot/connector/derivative/okx_perpetual/okx_perpetual_user_stream_data_source.py:ro
       - ./hummingbot/connector/derivative/okx_perpetual/okx_perpetual_derivative.py:/home/hummingbot/hummingbot/connector/derivative/okx_perpetual/okx_perpetual_derivative.py:ro
+      - ./hummingbot/data_feed/candles_feed/okx_perpetual_candles/constants.py:/home/hummingbot/hummingbot/data_feed/candles_feed/okx_perpetual_candles/constants.py:ro
+      - ./hummingbot/data_feed/candles_feed/okx_perpetual_candles/okx_perpetual_candles.py:/home/hummingbot/hummingbot/data_feed/candles_feed/okx_perpetual_candles/okx_perpetual_candles.py:ro
       - ./hummingbot/connector/perpetual_derivative_py_base.py:/home/hummingbot/hummingbot/connector/perpetual_derivative_py_base.py:ro
       - ./hummingbot/core/data_type/order_book_tracker.py:/home/hummingbot/hummingbot/core/data_type/order_book_tracker.py:ro
       - ./hummingbot/strategy_v2/executors/position_executor/data_types.py:/home/hummingbot/hummingbot/strategy_v2/executors/position_executor/data_types.py:ro

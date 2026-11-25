@@ -34,11 +34,32 @@ class MeanReversionSettings(BaseModel):
     stop_loss_cooldown_time: int = Field(default=900, ge=1)
     time_limit: int = Field(default=3600, ge=60)
     require_closed_candle_confirmation: bool = Field(default=True)
-    signal_mode: Literal["reversion", "momentum"] = "reversion"
+    signal_mode: Literal["reversion", "momentum", "human_swing"] = "reversion"
     momentum_lookback: int = Field(default=16, ge=2, le=500)
     momentum_threshold: Decimal = Field(default=Decimal("0.008"), ge=0, lt=1)
     risk_frac: Decimal = Field(default=Decimal("0.02"), gt=0, lt=1)
     long_only: bool = True
+
+    # Human trend-regime swing parameters (aligned with okx_human_trader.py & regime_engine.py)
+    require_btc_4h: bool = True
+    min_breadth_frac: Decimal = Field(default=Decimal("0.60"), ge=0, le=1)
+    er4h_soft_thresh: Decimal = Field(default=Decimal("0.22"), ge=0, le=1)
+    er4h_soft_scale: Decimal = Field(default=Decimal("0.50"), gt=0, le=1)
+    max_dist_e144_atr15: Decimal = Field(default=Decimal("1.2"), ge=0)
+    swing_tp_pct: Decimal = Field(default=Decimal("0.045"), gt=0, lt=1)
+    adaptive_trail: bool = True
+    trail_atr_mult: Decimal = Field(default=Decimal("3.2"), gt=0)
+    trail_trig_min: Decimal = Field(default=Decimal("0.012"), gt=0, lt=1)
+    trail_trig_max: Decimal = Field(default=Decimal("0.018"), gt=0, lt=1)
+    trail_pb_ratio: Decimal = Field(default=Decimal("0.375"), gt=0, lt=1)
+    trail_pb_min: Decimal = Field(default=Decimal("0.0045"), gt=0, lt=1)
+    trail_pb_max: Decimal = Field(default=Decimal("0.0065"), gt=0, lt=1)
+    max_positions: int = Field(default=3, ge=1, le=20)
+    margin_ratio: Decimal = Field(default=Decimal("0.20"), gt=0, le=1)
+    max_margin_cap: Decimal = Field(default=Decimal("2500"), gt=0)
+    unprot_2nd_scale: Decimal = Field(default=Decimal("0.60"), gt=0, le=1)
+    unprot_3rd_scale: Decimal = Field(default=Decimal("0.40"), gt=0, le=1)
+    daily_loss_limit: Decimal = Field(default=Decimal("0.02"), ge=0, lt=1)
 
     @model_validator(mode="after")
     def validate_relationships(self):

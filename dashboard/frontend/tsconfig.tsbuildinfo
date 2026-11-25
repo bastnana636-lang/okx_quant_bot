@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/types.ts","./src/components/coinbadge.tsx","./src/components/confirmmodal.tsx","./src/components/equitychart.tsx","./src/utils/format.ts","./src/views/configview.tsx","./src/views/logsview.tsx","./src/views/marketsview.tsx","./src/views/overviewview.tsx","./src/views/positionsview.tsx"],"version":"5.9.3"}

@@ -100,7 +100,7 @@ def test_save_updates_leverage_and_notional(tmp_path: Path):
 def test_rejects_invalid_leverage_and_z_order(tmp_path: Path):
     script, controllers = _layout(tmp_path)
     view = load_config(script, controllers)
-    view["pairs"][0]["leverage"] = "9"
+    view["pairs"][0]["leverage"] = "25"
     with pytest.raises(ConfigError, match="杠杆"):
         apply_config(view, script, controllers)
     view["pairs"][0]["leverage"] = "3"
@@ -186,3 +186,44 @@ def test_switch_saves_the_mode_before_restart(monkeypatch):
     assert mode == "both"
     assert "多空双向" in message
     assert order == [("save", False), ("restart",)]
+
+
+def test_per_pair_overrides_and_enable_disable(tmp_path: Path):
+    from dashboard.strategy_config import active_controller_names, add_pair_config
+
+    script, controllers = _layout(tmp_path)
+    view = load_config(script, controllers, include_inactive=True)
+    # Default long_only in optional defaults & presets is bidirectional ("false")
+    assert view["defaults"]["long_only"] == "false"
+    assert view["presets"][0]["shared"]["long_only"] == "false"
+
+    # Override BTC to 1h momentum while keeping ETH on 5m reversion
+    view["pairs"][0]["overrides"] = {
+        "signal_mode": "momentum",
+        "candles_interval": "1h",
+        "momentum_lookback": "16",
+        "momentum_threshold": "0.01",
+    }
+    apply_config({"pairs": view["pairs"], "shared": view["shared"]}, script, controllers)
+    btc_text = (controllers / "conf_okx_pmm_btc.yml").read_text(encoding="utf-8")
+    eth_text = (controllers / "conf_okx_pmm_eth.yml").read_text(encoding="utf-8")
+    assert "signal_mode: momentum" in btc_text
+    assert "candles_interval: 1h" in btc_text
+    assert "candles_interval: 5m" in eth_text
+
+    # Add a new pair (defaults to long_only: false)
+    created = add_pair_config("LINK-USDT", leverage=4, total_amount_quote=100, script_file=script, controllers_dir=controllers)
+    assert created["file"] == "conf_okx_pmm_link.yml"
+    assert "long_only: false" in (controllers / "conf_okx_pmm_link.yml").read_text(encoding="utf-8")
+    assert active_controller_names(script) == ["conf_okx_pmm_btc.yml", "conf_okx_pmm_eth.yml", "conf_okx_pmm_link.yml"]
+
+    # Disable ETH via enabled_files
+    updated_view = load_config(script, controllers, include_inactive=True)
+    kept = [p for p in updated_view["all_pairs"] if p["file"] != "conf_okx_pmm_eth.yml"]
+    apply_config(
+        {"enabled_files": [p["file"] for p in kept], "pairs": kept, "shared": updated_view["shared"]},
+        script,
+        controllers,
+    )
+    assert active_controller_names(script) == ["conf_okx_pmm_btc.yml", "conf_okx_pmm_link.yml"]
+

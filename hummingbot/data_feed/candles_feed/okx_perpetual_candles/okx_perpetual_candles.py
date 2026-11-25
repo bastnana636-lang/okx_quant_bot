@@ -1,5 +1,8 @@
+import asyncio
 import logging
+import time
 from typing import List, Optional
+from weakref import WeakKeyDictionary
 
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
@@ -9,6 +12,9 @@ from hummingbot.logger import HummingbotLogger
 
 class OKXPerpetualCandles(CandlesBase):
     _logger: Optional[HummingbotLogger] = None
+    _network_check_locks: "WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = WeakKeyDictionary()
+    _last_network_check_ts: float = 0.0
+    _NETWORK_CHECK_TTL_SECONDS: float = 5.0
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -56,10 +62,23 @@ class OKXPerpetualCandles(CandlesBase):
         return CONSTANTS.INTERVALS
 
     async def check_network(self) -> NetworkStatus:
-        rest_assistant = await self._api_factory.get_rest_assistant()
-        await rest_assistant.execute_request(url=self.health_check_url,
-                                             throttler_limit_id=CONSTANTS.HEALTH_CHECK_ENDPOINT)
-        return NetworkStatus.CONNECTED
+        loop = asyncio.get_running_loop()
+        lock = OKXPerpetualCandles._network_check_locks.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            OKXPerpetualCandles._network_check_locks[loop] = lock
+        # Coalesce multi-pair / multi-timeframe health checks so 44 feeds do not burst /api/v5/public/time.
+        async with lock:
+            now = time.monotonic()
+            if now - OKXPerpetualCandles._last_network_check_ts < OKXPerpetualCandles._NETWORK_CHECK_TTL_SECONDS:
+                return NetworkStatus.CONNECTED
+            rest_assistant = await self._api_factory.get_rest_assistant()
+            await rest_assistant.execute_request(
+                url=self.health_check_url,
+                throttler_limit_id=CONSTANTS.HEALTH_CHECK_ENDPOINT,
+            )
+            OKXPerpetualCandles._last_network_check_ts = time.monotonic()
+            return NetworkStatus.CONNECTED
 
     def get_exchange_trading_pair(self, trading_pair):
         return f"{trading_pair}-SWAP"

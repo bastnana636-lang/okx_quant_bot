@@ -625,6 +625,28 @@ class StrategyV2Base(StrategyPyBase):
             lines.extend(["", "*** WARNINGS ***"] + warning_lines)
         return "\n".join(lines)
 
+    def balance_warning(self, market_trading_pair_tuples: List[MarketTradingPairTuple]) -> List[str]:
+        """Skip spot base-asset warnings on Python perpetual connectors that settle in quote margin."""
+        spot_tuples = []
+        warning_lines = []
+        seen_perp_quote = set()
+        for market_pair in market_trading_pair_tuples:
+            market = market_pair.market
+            is_perp = hasattr(market, "account_positions") or "_perpetual" in getattr(market, "name", "")
+            if is_perp:
+                key = (market.name, market_pair.quote_asset)
+                if key not in seen_perp_quote:
+                    seen_perp_quote.add(key)
+                    if market.get_balance(market_pair.quote_asset) <= Decimal("0.0001"):
+                        warning_lines.append(
+                            f"  {market.name} market {market_pair.quote_asset} balance is too low. Cannot place order."
+                        )
+            else:
+                spot_tuples.append(market_pair)
+        if spot_tuples:
+            warning_lines.extend(super().balance_warning(spot_tuples))
+        return warning_lines
+
     def get_structured_status(self) -> Dict[str, Any]:
         """
         Returns structured status data (performance, positions_held, executors, orders, signals).
@@ -707,6 +729,11 @@ class StrategyV2Base(StrategyPyBase):
                 try:
                     report = self.get_performance_report(controller_id)
                     if report:
+                        raw_counts = getattr(report, "close_type_counts", {}) or {}
+                        safe_counts = {
+                            (k.name if hasattr(k, "name") else str(k)): v
+                            for k, v in raw_counts.items()
+                        }
                         performance_data.append({
                             "controller": controller_id,
                             "realized": float(report.realized_pnl_quote),
@@ -714,7 +741,7 @@ class StrategyV2Base(StrategyPyBase):
                             "global": float(report.global_pnl_quote),
                             "global_pct": f"{float(report.global_pnl_pct):.2f}%",
                             "volume": float(report.volume_traded),
-                            "close_type_counts": getattr(report, "close_type_counts", {}),
+                            "close_type_counts": safe_counts,
                         })
                 except Exception:
                     pass

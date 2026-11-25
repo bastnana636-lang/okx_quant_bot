@@ -56,17 +56,18 @@ FUNDING_PAYMENT_TYPE = "8"
 # -------------------------------------------
 # WEB SOCKET ENDPOINTS
 # -------------------------------------------
-WSS_PUBLIC_URLS = {DEFAULT_DOMAIN: f"wss://ws.okx.com:8443/ws/{REST_API_VERSION}/public",
-                   AWS_DOMAIN: f"wss://wsaws.okx.com:8443/ws/{REST_API_VERSION}/public",
-                   DEMO_DOMAIN: f"wss://wspap.okx.com:8443/ws/{REST_API_VERSION}/public?brokerId=9999"}
+# OKX deprecated WebSocket port 8443 in favor of standard TLS port 443.
+WSS_PUBLIC_URLS = {DEFAULT_DOMAIN: f"wss://ws.okx.com/ws/{REST_API_VERSION}/public",
+                   AWS_DOMAIN: f"wss://wsaws.okx.com/ws/{REST_API_VERSION}/public",
+                   DEMO_DOMAIN: f"wss://wspap.okx.com/ws/{REST_API_VERSION}/public?brokerId=9999"}
 
-WSS_PRIVATE_URLS = {DEFAULT_DOMAIN: f"wss://ws.okx.com:8443/ws/{REST_API_VERSION}/private",
-                    AWS_DOMAIN: f"wss://wsaws.okx.com:8443/ws/{REST_API_VERSION}/private",
-                    DEMO_DOMAIN: f"wss://wspap.okx.com:8443/ws/{REST_API_VERSION}/private?brokerId=9999"}
+WSS_PRIVATE_URLS = {DEFAULT_DOMAIN: f"wss://ws.okx.com/ws/{REST_API_VERSION}/private",
+                    AWS_DOMAIN: f"wss://wsaws.okx.com/ws/{REST_API_VERSION}/private",
+                    DEMO_DOMAIN: f"wss://wspap.okx.com/ws/{REST_API_VERSION}/private?brokerId=9999"}
 
-WSS_BUSINESS_URLS = {DEFAULT_DOMAIN: f"wss://ws.okx.com:8443/ws/{REST_API_VERSION}/business",
-                     AWS_DOMAIN: f"wss://wsaws.okx.com:8443/ws/{REST_API_VERSION}/business",
-                     DEMO_DOMAIN: f"wss://wspap.okx.com:8443/ws/{REST_API_VERSION}/business?brokerId=9999"}
+WSS_BUSINESS_URLS = {DEFAULT_DOMAIN: f"wss://ws.okx.com/ws/{REST_API_VERSION}/business",
+                     AWS_DOMAIN: f"wss://wsaws.okx.com/ws/{REST_API_VERSION}/business",
+                     DEMO_DOMAIN: f"wss://wspap.okx.com/ws/{REST_API_VERSION}/business?brokerId=9999"}
 SECONDS_TO_WAIT_TO_RECEIVE_MESSAGE = 25
 WS_PING_REQUEST = "ping"
 WS_PONG_RESPONSE = "pong"
@@ -160,7 +161,7 @@ WS_SUBSCRIPTION_LIMIT = 480  # subscriptions per minute
 # Public endpoint rate limits (requests per 2 seconds)
 RATE_LIMIT_LATEST_SYMBOL_INFO = 20
 RATE_LIMIT_ORDER_BOOK = 40
-RATE_LIMIT_SERVER_TIME = 10
+RATE_LIMIT_SERVER_TIME = 8
 RATE_LIMIT_GET_INSTRUMENTS = 20
 
 # Pair-specific endpoint rate limits (requests per 2 seconds)
@@ -174,7 +175,7 @@ RATE_LIMIT_PLACE_ACTIVE_ORDER = 60  # per 2 seconds
 RATE_LIMIT_CANCEL_ACTIVE_ORDER = 60  # per 2 seconds
 RATE_LIMIT_SET_LEVERAGE = 20  # per 2 seconds
 RATE_LIMIT_USER_TRADE_RECORDS = 120  # per 60 seconds
-RATE_LIMIT_GET_POSITIONS = 10  # per 2 seconds
+RATE_LIMIT_GET_POSITIONS = 8  # per 2 seconds
 RATE_LIMIT_GET_WALLET_BALANCE = 10  # per 2 seconds
 RATE_LIMIT_GET_ACCOUNT_CONFIG = 5  # per 2 seconds
 RATE_LIMIT_SET_POSITION_MODE = 5  # per 2 seconds

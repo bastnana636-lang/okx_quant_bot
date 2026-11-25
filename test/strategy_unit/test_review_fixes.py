@@ -11,7 +11,6 @@ import yaml
 
 from dashboard.dashboard import (
     build_view,
-    render_html,
     parse_performance_table,
     parse_positions,
     parse_orders,
@@ -58,34 +57,24 @@ def test_okx_position_amount_no_integer_rounding():
 
 
 def test_dashboard_build_view_error_fallback():
-    # When status has error, build_view should return a valid dictionary that render_html can safely format
+    # When status has error, build_view should return a clean structured dictionary
     view = build_view({"error": "test error: status.json not found"})
     assert view["error"] == "test error: status.json not found"
-    assert "status_html" in view
+    assert view["running"] is False
+    assert view["stale"] is True
     assert "usdt_bal" in view
     assert "uptime_s" in view
     assert "uptime_str" in view
-
-    # Test that render_html does not crash with KeyError
-    html = render_html(view)
-    assert "status.json not found" in html
-    assert "OKX QUANTITATIVE TRADER" in html
+    assert isinstance(view["perf_rows"], list)
+    assert isinstance(view["positions"], list)
 
 
-def test_strategy_config_optional_fixed_tp():
-    # If fixed_unrealized_tp_quote is empty, _normalize_fields should leave it empty and not force '2'
-    source = {
-        "leverage": "3",
-        "total_amount_quote": "50",
-        "take_profit_quote": "1.2",
-        "fixed_unrealized_tp_quote": "",
-    }
-    normalized = _normalize_fields(source, PAIR_FIELDS)
-    assert normalized["fixed_unrealized_tp_quote"] == ""
-
-    # render_updates should render null when empty
-    updated = render_updates("fixed_unrealized_tp_quote: 2\ntotal_amount_quote: 50", {"fixed_unrealized_tp_quote": ""})
-    assert "fixed_unrealized_tp_quote: null" in updated
+def test_strategy_config_excludes_fixed_tp_fields():
+    pair_keys = {spec[0] for spec in PAIR_FIELDS}
+    assert "take_profit_quote" not in pair_keys
+    assert "fixed_unrealized_tp_quote" not in pair_keys
+    normalized = _normalize_fields({"leverage": "3", "total_amount_quote": "50"}, PAIR_FIELDS)
+    assert normalized == {"leverage": "3", "total_amount_quote": "50"}
 
 
 def test_position_executor_close_order_price_methods():
@@ -233,15 +222,15 @@ def test_structured_data_dashboard_parsing():
     assert signals["okx_pmm_sol"]["z"] == 2.45
     assert signals["okx_pmm_sol"]["signal"] == 1
 
-    # 6. build_view rendering with structured data
+    # 6. build_view structured payload with parsed data
     view = build_view(structured_status)
-    assert "SOL-USDT" in view["pos_html"]
-    assert "OKX 账户仓位" in view["pos_html"]
-    assert "BTC-USDT" in view["pos_html"]
-    assert "策略接管" in view["pos_html"]
-    assert "⚡ +2.45 (BUY)" in view["perf_html"]
-
-    html = render_html(structured_status)
-    assert "OKX 账户仓位" in html
-    assert "SOL-USDT" in html
+    assert view["error"] is None
+    assert view["running"] is True
+    assert len(view["positions"]) == 2
+    pos_by_pair = {p["pair"]: p for p in view["positions"]}
+    assert pos_by_pair["SOL-USDT"]["source"] == "OKX 账户仓位"
+    assert pos_by_pair["BTC-USDT"]["source"] == "策略接管"
+    sol_row = next(r for r in view["perf_rows"] if r["controller"] == "okx_pmm_sol")
+    assert sol_row["z_score"] == 2.45
+    assert sol_row["signal"] == 1
 
